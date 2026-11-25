@@ -118,7 +118,7 @@ KRAKEN = {"BTC": "XBTUSD", "ETH": "ETHUSD", "SOL": "SOLUSD", "XRP": "XRPUSD", "D
 # ==========================================
 # SIDEBAR SETTINGS
 # ==========================================
-MIN_EDGE = st.sidebar.slider("Minimum edge after fees (%)", -5, 15, -2) / 100  # Lowered to allow testing
+MIN_EDGE = st.sidebar.slider("Minimum edge after fees (%)", -5, 15, -2) / 100
 MIN_SECS = st.sidebar.slider("No new entries with less than (sec) left", 30, 300, 60)
 PRICE_CAP = st.sidebar.slider("Max contract price for SAFE buys (%)", 55, 95, 90) / 100
 SCALP_ON = st.sidebar.checkbox("Enable SCALP signals", True)
@@ -354,7 +354,6 @@ def analyse(asset):
 
     # 2. SCALP SIGNAL (Buy the dip in a trend)
     elif ready and SCALP_ON and secs >= 120 and abs(z) >= 0.3:
-        # If trend is up (z>0) but RSI is low (oversold), or trend is down (z<0) but RSI is high (overbought)
         if (z > 0 and rsi_v < 40) or (z < 0 and rsi_v > 60):
             mode, price = "scalp", ask
             plan = f"Quick bounce trade · target {(ask + SCALP_TP)*100:.0f}% · stop {(ask - SCALP_SL)*100:.0f}%"
@@ -390,7 +389,6 @@ def analyse(asset):
             elif b <= entry - SCALP_SL: a = ("✂️ STOP OUT", "cut", "Scalp failed.")
             else: a = ("✋ HOLD", "", "Waiting for target.")
         else:
-            # If the model flips completely against us, cut the loss
             if p_side < 0.35 and b > 0.05: a = ("✂️ CUT LOSS", "cut", "Model favors opposite side.")
             elif b >= 0.93: a = ("💰 CASH OUT NOW", "go", "Almost max payout.")
             else: a = ("✋ HOLD", "", f"Holding (~{p_side*100:.0f}%) beats selling.")
@@ -399,5 +397,25 @@ def analyse(asset):
 
     return dict(asset=asset, ticker=tk, spot=spot, strike=strike, pct=pct, chg5=(spot / allc[-6] - 1) * 100,
                 secs=secs, k_yes=k_yes, up=up, edge=edge * 100, mode=mode, side=side, price=price, plan=plan,
-                conf=min(100, abs(up - 0.5) * 100 + (sum(votes.values()) / 5)*30), votes=votes, rsi=rsi_v, 
-                poss=poss,
+                conf=min(100, abs(up - 0.5) * 100 + (sum(votes.values()) / 5)*30), 
+                votes=votes, rsi=rsi_v, poss=poss, srcs="+".join(px) or "Coinbase", closes=allc[-15:])
+
+# ==========================================
+# LIVE DASHBOARD
+# ==========================================
+@st.fragment(run_every=5)
+def live():
+    res = []
+    for a in ASSETS:
+        try: res.append(analyse(a))
+        except Exception as e: res.append({"asset": a, "err": str(e)[:160]})
+        
+    n, wins, avg = db.execute("SELECT COUNT(*), COALESCE(SUM(win),0), COALESCE(AVG(pnl),0) FROM pos WHERE status!='open'").fetchone()
+    op = db.execute("SELECT COUNT(*) FROM pos WHERE status='open'").fetchone()[0]
+    wr = f"{wins/n*100:.1f}%" if n else "—"
+    now = datetime.now(timezone.utc)
+    
+    st.markdown(
+        f'<div class="top"><div><div class="title">⚡ Kalshi 15-Min Crypto Desk</div>'
+        f'<div class="sub">Settlement-aware model · multi-exchange price · self-check · auto-trading enabled</div></div>'
+        f'<div class="live">● LIVE · {now.strftime("%H:%M:%S")} UTC<br><span class="sub">next 1-min candle in {60-now.second}s</span
