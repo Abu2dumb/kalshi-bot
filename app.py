@@ -40,9 +40,9 @@ def place_order(ticker, side, count, price_dollars, tif="immediate_or_cancel"):
     payload = {
         "ticker": ticker,
         "client_order_id": f"bot-{int(time.time()*1000)}",
-        "side": api_side,  # <-- FIXED: 'bid' or 'ask'
+        "side": api_side,
         "action": "buy",
-        "count": f"{int(count)}.00",  # <-- FIXED: string format
+        "count": f"{int(count)}.00",
         "price": f"{price_dollars:.4f}",
         "time_in_force": tif,
         "self_trade_prevention_type": "taker_at_cross" 
@@ -50,7 +50,6 @@ def place_order(ticker, side, count, price_dollars, tif="immediate_or_cancel"):
     headers = get_headers("POST", path)
     res = requests.post(f"https://api.elections.kalshi.com{path}", json=payload, headers=headers, timeout=10)
     
-    # Log the actual response for debugging
     if res.status_code != 201:
         print(f"Order Error {res.status_code}: {res.text}")
         
@@ -359,6 +358,8 @@ def analyse(asset):
                         db.execute("INSERT OR IGNORE INTO pos(key,ticker,asset,kind,side,entry,peak,close_time,status) VALUES(?,?,?,?,?,?,?,?,'open')",
                                    (tk + mode, tk, asset, mode, side, ask, ask, ct))
                         db.commit()
+                    else:
+                        st.toast(f"❌ {asset}: Order failed {status}", icon="🚨")
 
     # 2. SCALP SIGNAL (Buy the dip in a trend)
     elif ready and SCALP_ON and secs >= 120 and abs(z) >= 0.3:
@@ -378,6 +379,8 @@ def analyse(asset):
                             db.execute("INSERT OR IGNORE INTO pos(key,ticker,asset,kind,side,entry,peak,close_time,status) VALUES(?,?,?,?,?,?,?,?,'open')",
                                        (tk + mode, tk, asset, mode, side, ask, ask, ct))
                             db.commit()
+                        else:
+                            st.toast(f"❌ {asset}: Scalp Order failed {status}", icon="🚨")
 
     # --- MANAGE POSITIONS & CASH OUT ---
     poss = []
