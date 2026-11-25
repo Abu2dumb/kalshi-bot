@@ -32,8 +32,7 @@ def get_headers(method, path):
         "Content-Type": "application/json"
     }
 
-def place_order(ticker, side, count, price_dollars, tif="immediate_or_cancel"):
-    # Map yes/no to the correct Kalshi V2 side
+def place_order(ticker, side, count, price_dollars, action="buy", tif="immediate_or_cancel"):
     api_side = "bid" if side == "yes" else "ask"
     
     path = "/trade-api/v2/portfolio/events/orders"
@@ -41,7 +40,7 @@ def place_order(ticker, side, count, price_dollars, tif="immediate_or_cancel"):
         "ticker": ticker,
         "client_order_id": f"bot-{int(time.time()*1000)}",
         "side": api_side,
-        "action": "buy",
+        "action": action,
         "count": f"{int(count)}.00",
         "price": f"{price_dollars:.4f}",
         "time_in_force": tif,
@@ -109,7 +108,12 @@ st.markdown("""<style>
 DB_FILE = "calls3.db"
 db = sqlite3.connect(DB_FILE, check_same_thread=False)
 db.execute("""CREATE TABLE IF NOT EXISTS pos(key TEXT PRIMARY KEY, ticker TEXT, asset TEXT, kind TEXT, side TEXT,
-entry REAL, peak REAL, close_time TEXT, status TEXT, exit REAL, pnl REAL, win INTEGER)""")
+count INTEGER, entry REAL, peak REAL, close_time TEXT, status TEXT, exit REAL, pnl REAL, win INTEGER)""")
+try:
+    db.execute("ALTER TABLE pos ADD COLUMN count INTEGER")
+except sqlite3.OperationalError:
+    pass # Column already exists
+
 db.execute("""CREATE TABLE IF NOT EXISTS preds(ticker TEXT PRIMARY KEY, asset TEXT, model REAL, kalshi REAL,
 final REAL, close_time TEXT, result TEXT)""")
 
@@ -141,6 +145,11 @@ st.sidebar.header("🟢 Auto-Trading")
 AUTO_TRADE_SAFE = st.sidebar.toggle("Auto-Trade SAFE signals", value=True)
 AUTO_TRADE_SCALP = st.sidebar.toggle("Auto-Trade SCALP signals", value=True)
 MAX_TRADE_USD = st.sidebar.slider("Max $ per trade", 1.0, 50.0, 2.0, step=1.0)
+
+st.sidebar.markdown("---")
+st.sidebar.header("💰 Auto-Sell Settings")
+AUTO_SELL_PROFIT = st.sidebar.toggle("Auto-Sell for profit if confidence drops", value=True)
+SELL_CONFIDENCE = st.sidebar.slider("Sell if win chance drops below (%)", 20, 80, 50) / 100
 
 if st.sidebar.button("Reset history"):
     db.execute("DELETE FROM pos"); db.execute("DELETE FROM preds"); db.commit(); st.session_state.pop("toasted", None)
@@ -229,6 +238,26 @@ def live_price(asset, product):
         except Exception: pass
     return out
 
+# --- CLEAN UP EXPIRED POSITIONS ---
+def grade():
+    now = datetime.now(timezone.utc).isoformat()
+    tks = {r[0] for r in db.execute("SELECT ticker FROM pos WHERE status='open' AND close_time < ?", (now,)).fetchall()}
+    for t in list(tks)[:10]:
+        try:
+            m = get_kalshi(f"{KALSHI}/markets/{t}").get("market", {})
+            res = m.get("result")
+            if res in ("yes", "no", "void"):
+                for key, side, entry in db.execute("SELECT key,side,entry FROM pos WHERE ticker=? AND status='open'", (t,)).fetchall():
+                    if res == "void":
+                        db.execute("UPDATE pos SET status='settled', exit=?, pnl=0, win=0 WHERE key=?", (entry, key))
+                    else:
+                        won = res == side
+                        ex = 1.0 if won else 0.0
+                        db.execute("UPDATE pos SET status='settled', exit=?, pnl=?, win=? WHERE key=?",
+                                   (ex, (ex - entry) / entry * 100, int(won), key))
+                db.commit()
+        except Exception: pass
+
 # ==========================================
 # UI COMPONENTS
 # ==========================================
@@ -254,7 +283,7 @@ def pos_html(p):
     head = f'{kind} {p["side"].upper()} @ {p["entry"]*100:.0f}¢'
     if p["status"] != "open":
         pn = p["pnl"] or 0
-        return (f'<div class="cash"><div class="act">✅ SETTLED · {head}</div>Exit {p["exit"]*100:.0f}¢ · '
+        return (f'<div class="cash"><div class="act">✅ SETTLED/CLOSED · {head}</div>Exit {p["exit"]*100:.0f}¢ · '
                 f'<span class="{"up" if pn >= 0 else "dn"}">{pn:+.1f}%</span></div>')
     return (f'<div class="cash {p["cls"]}"><div class="act">{p["act"]}</div>{p["why"]}<br>{head} · exit now {p["bid"]*100:.0f}¢ · '
             f'<span class="{"up" if p["pnl"] >= 0 else "dn"}">{p["pnl"]:+.1f}%</span></div>')
@@ -352,11 +381,11 @@ def analyse(asset):
             if not existing:
                 contracts = int(MAX_TRADE_USD // ask) if ask else 0
                 if contracts >= 1:
-                    status, resp = place_order(tk, side, contracts, ask)
+                    status, resp = place_order(tk, side, contracts, ask, action="buy")
                     if status == 201:
                         st.toast(f"✅ {asset}: AUTO-BOUGHT SAFE {contracts}x {side.upper()}", icon="💰")
-                        db.execute("INSERT OR IGNORE INTO pos(key,ticker,asset,kind,side,entry,peak,close_time,status) VALUES(?,?,?,?,?,?,?,?,'open')",
-                                   (tk + mode, tk, asset, mode, side, ask, ask, ct))
+                        db.execute("INSERT OR IGNORE INTO pos(key,ticker,asset,kind,side,count,entry,peak,close_time,status) VALUES(?,?,?,?,?,?,?,?,?,'open')",
+                                   (tk + mode, tk, asset, mode, side, contracts, ask, ask, ct))
                         db.commit()
                     else:
                         st.toast(f"❌ {asset}: Order failed {status}", icon="🚨")
@@ -373,28 +402,41 @@ def analyse(asset):
                 if not existing:
                     contracts = int(MAX_TRADE_USD // ask) if ask else 0
                     if contracts >= 1:
-                        status, resp = place_order(tk, side, contracts, ask)
+                        status, resp = place_order(tk, side, contracts, ask, action="buy")
                         if status == 201:
                             st.toast(f"⚡ {asset}: AUTO-BOUGHT SCALP {contracts}x {side.upper()}", icon="⚡")
-                            db.execute("INSERT OR IGNORE INTO pos(key,ticker,asset,kind,side,entry,peak,close_time,status) VALUES(?,?,?,?,?,?,?,?,'open')",
-                                       (tk + mode, tk, asset, mode, side, ask, ask, ct))
+                            db.execute("INSERT OR IGNORE INTO pos(key,ticker,asset,kind,side,count,entry,peak,close_time,status) VALUES(?,?,?,?,?,?,?,?,?,'open')",
+                                       (tk + mode, tk, asset, mode, side, contracts, ask, ask, ct))
                             db.commit()
                         else:
                             st.toast(f"❌ {asset}: Scalp Order failed {status}", icon="🚨")
 
     # --- MANAGE POSITIONS & CASH OUT ---
     poss = []
-    for key, kind, s, entry, peak, status, ex, pn in db.execute(
-            "SELECT key,kind,side,entry,peak,status,exit,pnl FROM pos WHERE ticker=?", (tk,)).fetchall():
+    for key, kind, s, c_count, entry, peak, status, ex, pn in db.execute(
+            "SELECT key,kind,side,count,entry,peak,status,exit,pnl FROM pos WHERE ticker=?", (tk,)).fetchall():
         if status != "open":
             poss.append(dict(kind=kind, side=s, entry=entry, status=status, exit=ex, pnl=pn)); continue
+            
         b = yb if s == "yes" else nb
         if b is None: continue
         
         pnl = (b - entry) / entry * 100
         p_side = up if s == "yes" else 1 - up
         
-        # Cash out logic
+        # --- AUTO SELL FOR PROFIT (NEW) ---
+        if AUTO_SELL_PROFIT and pnl > 0 and p_side < SELL_CONFIDENCE:
+            status_sell, resp = place_order(tk, s, c_count or 1, b, action="sell")
+            if status_sell == 201:
+                st.toast(f"💰 {asset}: AUTO-SOLD PROFIT {c_count}x {s.upper()}", icon="💰")
+                db.execute("UPDATE pos SET status='closed', exit=?, pnl=?, win=1 WHERE key=?", (b, pnl, key))
+                db.commit()
+                poss.append(dict(kind=kind, side=s, entry=entry, status="closed", exit=b, pnl=pnl))
+                continue # Skip the rest of this position's display logic
+            else:
+                st.toast(f"❌ {asset}: Auto-sell failed {status_sell}", icon="🚨")
+
+        # --- DISPLAY CASH OUT LOGIC ---
         if kind == "scalp":
             if b >= entry + SCALP_TP: a = ("💰 CASH OUT NOW", "go", "Scalp target hit.")
             elif b <= entry - SCALP_SL: a = ("✂️ STOP OUT", "cut", "Scalp failed.")
@@ -402,6 +444,7 @@ def analyse(asset):
         else:
             if p_side < 0.35 and b > 0.05: a = ("✂️ CUT LOSS", "cut", "Model favors opposite side.")
             elif b >= 0.93: a = ("💰 CASH OUT NOW", "go", "Almost max payout.")
+            elif pnl > 0 and p_side < SELL_CONFIDENCE: a = ("💰 SELL NOW", "go", "Confidence dropped below sell threshold.")
             else: a = ("✋ HOLD", "", f"Holding (~{p_side*100:.0f}%) beats selling.")
             
         poss.append(dict(kind=kind, side=s, entry=entry, status="open", bid=b, act=a[0], cls=a[1], why=a[2], pnl=pnl))
@@ -416,6 +459,9 @@ def analyse(asset):
 # ==========================================
 @st.fragment(run_every=5)
 def live():
+    # Clean up old expired trades
+    grade()
+    
     res = []
     for a in ASSETS:
         try: res.append(analyse(a))
