@@ -33,19 +33,27 @@ def get_headers(method, path):
     }
 
 def place_order(ticker, side, count, price_dollars, tif="immediate_or_cancel"):
+    # Map yes/no to the correct Kalshi V2 side
+    api_side = "bid" if side == "yes" else "ask"
+    
     path = "/trade-api/v2/portfolio/events/orders"
     payload = {
         "ticker": ticker,
         "client_order_id": f"bot-{int(time.time()*1000)}",
-        "side": side,
+        "side": api_side,  # <-- FIXED: 'bid' or 'ask'
         "action": "buy",
-        "count": str(int(count)),
+        "count": f"{int(count)}.00",  # <-- FIXED: string format
         "price": f"{price_dollars:.4f}",
         "time_in_force": tif,
         "self_trade_prevention_type": "taker_at_cross" 
     }
     headers = get_headers("POST", path)
     res = requests.post(f"https://api.elections.kalshi.com{path}", json=payload, headers=headers, timeout=10)
+    
+    # Log the actual response for debugging
+    if res.status_code != 201:
+        print(f"Order Error {res.status_code}: {res.text}")
+        
     return res.status_code, res.text
 
 # ==========================================
@@ -118,7 +126,7 @@ KRAKEN = {"BTC": "XBTUSD", "ETH": "ETHUSD", "SOL": "SOLUSD", "XRP": "XRPUSD", "D
 # ==========================================
 # SIDEBAR SETTINGS
 # ==========================================
-MIN_EDGE = st.sidebar.slider("Minimum edge after fees (%)", -5, 15, -2) / 100
+MIN_EDGE = st.sidebar.slider("Minimum edge after fees (%)", -10, 15, -2) / 100
 MIN_SECS = st.sidebar.slider("No new entries with less than (sec) left", 30, 300, 60)
 PRICE_CAP = st.sidebar.slider("Max contract price for SAFE buys (%)", 55, 95, 90) / 100
 SCALP_ON = st.sidebar.checkbox("Enable SCALP signals", True)
