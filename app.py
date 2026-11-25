@@ -13,7 +13,7 @@ except Exception:
 # ==========================================
 KALSHI_KEY_ID = os.environ.get("KALSHI_KEY_ID")
 PEM = os.environ.get("KALSHI_PEM")
-KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
+KALSHI = "https://api.elections.kalshi.com"
 
 if not KALSHI_KEY_ID or not PEM:
     st.error("Missing KALSHI_KEY_ID or KALSHI_PEM environment variables in Fly.io Secrets.")
@@ -47,12 +47,20 @@ def place_order(ticker, side, count, price_dollars, action="buy", tif="immediate
         "self_trade_prevention_type": "taker_at_cross" 
     }
     headers = get_headers("POST", path)
-    res = requests.post(f"https://api.elections.kalshi.com{path}", json=payload, headers=headers, timeout=10)
+    res = requests.post(f"{KALSHI}{path}", json=payload, headers=headers, timeout=10)
     
     if res.status_code != 201:
         print(f"Order Error {res.status_code}: {res.text}")
         
     return res.status_code, res.text
+
+def get_kalshi(path, **params):
+    try:
+        r = requests.get(f"{KALSHI}{path}", params=params, headers=get_headers("GET", path), timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return {}
 
 # ==========================================
 # UI STYLING
@@ -112,7 +120,7 @@ count INTEGER, entry REAL, peak REAL, close_time TEXT, status TEXT, exit REAL, p
 try:
     db.execute("ALTER TABLE pos ADD COLUMN count INTEGER")
 except sqlite3.OperationalError:
-    pass # Column already exists
+    pass
 
 db.execute("""CREATE TABLE IF NOT EXISTS preds(ticker TEXT PRIMARY KEY, asset TEXT, model REAL, kalshi REAL,
 final REAL, close_time TEXT, result TEXT)""")
@@ -133,7 +141,6 @@ MIN_EDGE = st.sidebar.slider("Minimum edge after fees (%)", -10, 15, -2) / 100
 MIN_SECS = st.sidebar.slider("No new entries with less than (sec) left", 30, 300, 60)
 PRICE_CAP = st.sidebar.slider("Max contract price for SAFE buys (%)", 55, 95, 90) / 100
 SCALP_ON = st.sidebar.checkbox("Enable SCALP signals", True)
-SCALP_TP = st.sidebar.slider("Scalp profit target (%)", 3, 15, 6) / 100
 SCALP_SL = st.sidebar.slider("Scalp stop loss (%)", 4, 12, 6) / 100
 BANKROLL = st.sidebar.number_input("Bankroll for stake suggestions ($)", 10, 100000, 100)
 KFRAC = st.sidebar.slider("Kelly fraction (smaller = safer)", 0.05, 0.5, 0.25)
@@ -148,8 +155,9 @@ MAX_TRADE_USD = st.sidebar.slider("Max $ per trade", 1.0, 50.0, 2.0, step=1.0)
 
 st.sidebar.markdown("---")
 st.sidebar.header("💰 Auto-Sell Settings")
-AUTO_SELL_PROFIT = st.sidebar.toggle("Auto-Sell for profit if confidence drops", value=True)
-SELL_CONFIDENCE = st.sidebar.slider("Sell if win chance drops below (%)", 20, 80, 50) / 100
+AUTO_SELL_ON = st.sidebar.toggle("Enable Auto-Selling", value=True)
+STANDARD_PROFIT_TARGET = st.sidebar.slider("Standard Trade Profit Target (%)", 10, 100, 35) / 100
+SELL_CONFIDENCE = st.sidebar.slider("Sell standard if confidence drops below (%)", 20, 80, 50) / 100
 
 if st.sidebar.button("Reset history"):
     db.execute("DELETE FROM pos"); db.execute("DELETE FROM preds"); db.commit(); st.session_state.pop("toasted", None)
@@ -162,14 +170,6 @@ def cdf(x, df=5):
     return 0.5 * (1 + math.erf(x / math.sqrt(2)))
 
 def fee(p): return 0.07 * p * (1 - p)
-
-def get_kalshi(url, **params):
-    try:
-        r = requests.get(url, params=params, headers=get_headers("GET", url.replace(KALSHI, "")), timeout=10)
-        r.raise_for_status()
-        return r.json()
-    except:
-        return {}
 
 def ema(v, n):
     k, out = 2 / (n + 1), [v[0]]
@@ -208,7 +208,7 @@ def settle_stat(S, secs, ticks, close_ts):
     return ((L - secs) * R + secs * S) / L, max((secs / L) ** 2 * secs / 3, 0.5)
 
 def market(series):
-    ms = get_kalshi(f"{KALSHI}/markets", series_ticker=series, status="open", limit=20).get("markets", [])
+    ms = get_kalshi("/trade-api/v2/markets", series_ticker=series, status="open", limit=20).get("markets", [])
     now = datetime.now(timezone.utc)
     ms = [m for m in ms if datetime.fromisoformat(m["close_time"].replace("Z", "+00:00")) > now]
     return min(ms, key=lambda m: m["close_time"]) if ms else None
@@ -244,7 +244,7 @@ def grade():
     tks = {r[0] for r in db.execute("SELECT ticker FROM pos WHERE status='open' AND close_time < ?", (now,)).fetchall()}
     for t in list(tks)[:10]:
         try:
-            m = get_kalshi(f"{KALSHI}/markets/{t}").get("market", {})
+            m = get_kalshi(f"/trade-api/v2/markets/{t}").get("market", {})
             res = m.get("result")
             if res in ("yes", "no", "void"):
                 for key, side, entry in db.execute("SELECT key,side,entry FROM pos WHERE ticker=? AND status='open'", (t,)).fetchall():
@@ -256,7 +256,8 @@ def grade():
                         db.execute("UPDATE pos SET status='settled', exit=?, pnl=?, win=? WHERE key=?",
                                    (ex, (ex - entry) / entry * 100, int(won), key))
                 db.commit()
-        except Exception: pass
+        except Exception as e:
+            print(f"Grade error for {t}: {e}")
 
 # ==========================================
 # UI COMPONENTS
@@ -283,7 +284,7 @@ def pos_html(p):
     head = f'{kind} {p["side"].upper()} @ {p["entry"]*100:.0f}¢'
     if p["status"] != "open":
         pn = p["pnl"] or 0
-        return (f'<div class="cash"><div class="act">✅ SETTLED/CLOSED · {head}</div>Exit {p["exit"]*100:.0f}¢ · '
+        return (f'<div class="cash"><div class="act">✅ CLOSED · {head}</div>Exit {p["exit"]*100:.0f}¢ · '
                 f'<span class="{"up" if pn >= 0 else "dn"}">{pn:+.1f}%</span></div>')
     return (f'<div class="cash {p["cls"]}"><div class="act">{p["act"]}</div>{p["why"]}<br>{head} · exit now {p["bid"]*100:.0f}¢ · '
             f'<span class="{"up" if p["pnl"] >= 0 else "dn"}">{p["pnl"]:+.1f}%</span></div>')
@@ -334,6 +335,9 @@ def analyse(asset):
     if m.get("floor_strike") is None: return {"asset": asset, "err": "Market has no target price"}
     strike, tk, ct = float(m["floor_strike"]), m["ticker"], m["close_time"]
     
+    close_dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
+    close_str = close_dt.isoformat()
+
     allc, vols, last_ts = candles(product)
     px = live_price(asset, product)
     spot = sum(px.values()) / len(px) if px else allc[-1]
@@ -343,11 +347,10 @@ def analyse(asset):
     now_ts = time.time()
     tb = st.session_state.setdefault("ticks", {}).setdefault(asset, [])
     tb.append((now_ts, spot)); del tb[:-200]
-    close_ts = datetime.fromisoformat(ct.replace("Z", "+00:00")).timestamp()
-    secs = max(close_ts - now_ts, 1)
+    secs = max(close_dt.timestamp() - now_ts, 1)
 
     sig = sigma_ps(closed)
-    mu_S, vf = settle_stat(spot, secs, tb, close_ts)
+    mu_S, vf = settle_stat(spot, secs, tb, close_dt.timestamp())
     z = math.log(mu_S / strike) / math.sqrt(sig * sig * vf + 0.0003 ** 2)
     p_stat = cdf(z)
     
@@ -385,7 +388,7 @@ def analyse(asset):
                     if status == 201:
                         st.toast(f"✅ {asset}: AUTO-BOUGHT SAFE {contracts}x {side.upper()}", icon="💰")
                         db.execute("INSERT OR IGNORE INTO pos(key,ticker,asset,kind,side,count,entry,peak,close_time,status) VALUES(?,?,?,?,?,?,?,?,?,'open')",
-                                   (tk + mode, tk, asset, mode, side, contracts, ask, ask, ct))
+                                   (tk + mode, tk, asset, mode, side, contracts, ask, ask, close_str))
                         db.commit()
                     else:
                         st.toast(f"❌ {asset}: Order failed {status}", icon="🚨")
@@ -406,7 +409,7 @@ def analyse(asset):
                         if status == 201:
                             st.toast(f"⚡ {asset}: AUTO-BOUGHT SCALP {contracts}x {side.upper()}", icon="⚡")
                             db.execute("INSERT OR IGNORE INTO pos(key,ticker,asset,kind,side,count,entry,peak,close_time,status) VALUES(?,?,?,?,?,?,?,?,?,'open')",
-                                       (tk + mode, tk, asset, mode, side, contracts, ask, ask, ct))
+                                       (tk + mode, tk, asset, mode, side, contracts, ask, ask, close_str))
                             db.commit()
                         else:
                             st.toast(f"❌ {asset}: Scalp Order failed {status}", icon="🚨")
@@ -421,29 +424,49 @@ def analyse(asset):
         b = yb if s == "yes" else nb
         if b is None: continue
         
-        pnl = (b - entry) / entry * 100
+        pnl = (b - entry) / entry * 100 # pnl is a percentage, e.g. 35.0 for 35%
         p_side = up if s == "yes" else 1 - up
         
-        # --- AUTO SELL FOR PROFIT (NEW) ---
-        if AUTO_SELL_PROFIT and pnl > 0 and p_side < SELL_CONFIDENCE:
+        should_sell = False
+        sell_reason = ""
+
+        # --- AUTO SELL LOGIC ---
+        if AUTO_SELL_ON:
+            if kind == "scalp":
+                # Scalp: Sell instantly if we see ANY profit (accounting for fees)
+                if pnl > 1.0: 
+                    should_sell = True
+                    sell_reason = f"Scalp Profit Secured (+{pnl:.1f}%)"
+            else:
+                # Standard: Sell if we hit the profit target slider
+                if pnl >= (STANDARD_PROFIT_TARGET * 100):
+                    should_sell = True
+                    sell_reason = f"Standard Profit Target Hit ({pnl:.1f}%)"
+                # Or sell if confidence drops significantly while we are in profit
+                elif pnl > 0 and p_side < SELL_CONFIDENCE:
+                    should_sell = True
+                    sell_reason = "Confidence dropped while in profit"
+
+        # Execute the sell order
+        if should_sell:
             status_sell, resp = place_order(tk, s, c_count or 1, b, action="sell")
             if status_sell == 201:
-                st.toast(f"💰 {asset}: AUTO-SOLD PROFIT {c_count}x {s.upper()}", icon="💰")
+                st.toast(f"💰 {asset}: AUTO-SOLD {kind.upper()} {c_count}x {s.upper()} · {sell_reason}", icon="💰")
                 db.execute("UPDATE pos SET status='closed', exit=?, pnl=?, win=1 WHERE key=?", (b, pnl, key))
                 db.commit()
                 poss.append(dict(kind=kind, side=s, entry=entry, status="closed", exit=b, pnl=pnl))
-                continue # Skip the rest of this position's display logic
+                continue
             else:
                 st.toast(f"❌ {asset}: Auto-sell failed {status_sell}", icon="🚨")
 
-        # --- DISPLAY CASH OUT LOGIC ---
+        # --- DISPLAY LOGIC (If it didn't auto-sell) ---
         if kind == "scalp":
             if b >= entry + SCALP_TP: a = ("💰 CASH OUT NOW", "go", "Scalp target hit.")
             elif b <= entry - SCALP_SL: a = ("✂️ STOP OUT", "cut", "Scalp failed.")
             else: a = ("✋ HOLD", "", "Waiting for target.")
         else:
             if p_side < 0.35 and b > 0.05: a = ("✂️ CUT LOSS", "cut", "Model favors opposite side.")
-            elif b >= 0.93: a = ("💰 CASH OUT NOW", "go", "Almost max payout.")
+            elif pnl >= (STANDARD_PROFIT_TARGET * 100): a = ("💰 CASH OUT NOW", "go", "Profit target hit.")
             elif pnl > 0 and p_side < SELL_CONFIDENCE: a = ("💰 SELL NOW", "go", "Confidence dropped below sell threshold.")
             else: a = ("✋ HOLD", "", f"Holding (~{p_side*100:.0f}%) beats selling.")
             
