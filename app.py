@@ -415,16 +415,28 @@ def live():
     wr = f"{wins/n*100:.1f}%" if n else "—"
     now = datetime.now(timezone.utc)
     
+    auto_color = "#22c55e" if AUTO_TRADE_SAFE else "#ef4444"
+    auto_text = "ON" if AUTO_TRADE_SAFE else "OFF"
+    
     st.markdown(
-        f'<div class="top"><div><div class="title">⚡ Kalshi 15-Min Crypto Desk</div>'
-        f'<div class="sub">Settlement-aware model · multi-exchange price · self-check · auto-trading enabled</div></div>'
-        f'<div class="live">● LIVE · {now.strftime("%H:%M:%S")} UTC<br><span class="sub">next 1-min candle in {60-now.second}s</span></div></div>'
-        f'<div class="stats"><div class="stat"><div class="l">Win rate</div><div class="v">{wr}</div></div>'
-        f'<div class="stat"><div class="l">Record</div><div class="v">{int(wins)} / {n-int(wins)}</div></div>'
-        f'<div class="stat"><div class="l">Avg result</div><div class="v">{avg:+.1f}%</div></div>'
-        f'<div class="stat"><div class="l">Open pos</div><div class="v">{op}</div></div>'
-        f'<div class="stat"><div class="l">Auto-Trade</div><div class="v" style="color:{"#22c55e" if AUTO_TRADE_SAFE else "#ef4444"}">{"ON" if AUTO_TRADE_SAFE else "OFF"}</div></div></div>',
-        unsafe_allow_html=True)
+        f"""
+        <div class="top">
+            <div>
+                <div class="title">⚡ Kalshi 15-Min Crypto Desk</div>
+                <div class="sub">Settlement-aware model · multi-exchange price · self-check · auto-trading enabled</div>
+            </div>
+            <div class="live">● LIVE · {now.strftime("%H:%M:%S")} UTC<br><span class="sub">next 1-min candle in {60-now.second}s</span></div>
+        </div>
+        <div class="stats">
+            <div class="stat"><div class="l">Win rate</div><div class="v">{wr}</div></div>
+            <div class="stat"><div class="l">Record</div><div class="v">{int(wins)} / {n-int(wins)}</div></div>
+            <div class="stat"><div class="l">Avg result</div><div class="v">{avg:+.1f}%</div></div>
+            <div class="stat"><div class="l">Open pos</div><div class="v">{op}</div></div>
+            <div class="stat"><div class="l">Auto-Trade</div><div class="v" style="color:{auto_color}">{auto_text}</div></div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
         
     cols = st.columns(3)
     for i, d in enumerate(res):
