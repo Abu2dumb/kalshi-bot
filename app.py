@@ -1,4 +1,4 @@
-import math, time, json, sqlite3, requests, pandas as pd, streamlit as st, os
+import math, time, json, sqlite3, requests, pandas as pd, streamlit as st, os, base64
 import streamlit.components.v1 as components
 from datetime import datetime, timezone
 from cryptography.hazmat.primitives import serialization
@@ -32,8 +32,6 @@ def get_headers(method, path):
         "Content-Type": "application/json"
     }
 
-import base64 # import explicitly for the header function
-
 def place_order(ticker, side, count, price_dollars, tif="immediate_or_cancel"):
     path = "/trade-api/v2/portfolio/events/orders"
     payload = {
@@ -51,7 +49,7 @@ def place_order(ticker, side, count, price_dollars, tif="immediate_or_cancel"):
     return res.status_code, res.text
 
 # ==========================================
-# UI STYLING (Matches your right-side screenshot)
+# UI STYLING
 # ==========================================
 st.set_page_config(page_title="Kalshi 15-Min Desk", page_icon="⚡", layout="wide")
 st.markdown("""<style>
@@ -120,9 +118,9 @@ KRAKEN = {"BTC": "XBTUSD", "ETH": "ETHUSD", "SOL": "SOLUSD", "XRP": "XRPUSD", "D
 # ==========================================
 # SIDEBAR SETTINGS
 # ==========================================
-MIN_EDGE = st.sidebar.slider("Minimum edge after fees (%)", 1, 15, 3) / 100
-MIN_SECS = st.sidebar.slider("No new entries with less than (sec) left", 30, 300, 90)
-PRICE_CAP = st.sidebar.slider("Max contract price for SAFE buys (%)", 55, 90, 78) / 100
+MIN_EDGE = st.sidebar.slider("Minimum edge after fees (%)", -5, 15, -2) / 100  # Lowered to allow testing
+MIN_SECS = st.sidebar.slider("No new entries with less than (sec) left", 30, 300, 60)
+PRICE_CAP = st.sidebar.slider("Max contract price for SAFE buys (%)", 55, 95, 90) / 100
 SCALP_ON = st.sidebar.checkbox("Enable SCALP signals", True)
 SCALP_TP = st.sidebar.slider("Scalp profit target (%)", 3, 15, 6) / 100
 SCALP_SL = st.sidebar.slider("Scalp stop loss (%)", 4, 12, 6) / 100
@@ -130,21 +128,12 @@ BANKROLL = st.sidebar.number_input("Bankroll for stake suggestions ($)", 10, 100
 KFRAC = st.sidebar.slider("Kelly fraction (smaller = safer)", 0.05, 0.5, 0.25)
 KCAP = st.sidebar.slider("Max stake per trade (% of bankroll)", 1, 10, 4) / 100
 PAUSE_ON = st.sidebar.checkbox("Pause new calls after 3 losses in a row", True)
-EARLY_ON = st.sidebar.checkbox("EARLY calls (earlier, less certain)", True)
-EARLY_P = st.sidebar.slider("Early call: minimum win chance (%)", 54, 72, 58) / 100
-EARLY_MIN_SECS = st.sidebar.slider("Early calls allowed until (sec left)", 120, 600, 240)
-OWN_ON = st.sidebar.checkbox("OWN calls (bot may disagree with Kalshi)", True)
-MODEL_W = st.sidebar.slider("Bot independence: trust its own model (%)", 0, 100, 70) / 100
-AUTO_W = st.sidebar.checkbox("Let the skill check set that automatically", False)
-MAX_DIS = st.sidebar.slider("Stand down if bot and Kalshi differ by more than (%)", 25, 60, 45) / 100
-FOLLOW = st.sidebar.checkbox("Follow Kalshi unless the bot has proven it is more accurate", True)
-LOCK_K = st.sidebar.slider("Never go against Kalshi when it is this sure (%)", 60, 95, 75) / 100
-picked = st.sidebar.multiselect("Assets", list(ASSETS), default=["BTC", "ETH", "SOL", "XRP", "DOGE"])
 
 st.sidebar.markdown("---")
 st.sidebar.header("🟢 Auto-Trading")
-AUTO_TRADE = st.sidebar.toggle("Enable Auto-Trading", value=False)
-MAX_TRADE_USD = st.sidebar.slider("Max $ per trade", 1.0, 50.0, 5.0, step=1.0)
+AUTO_TRADE_SAFE = st.sidebar.toggle("Auto-Trade SAFE signals", value=True)
+AUTO_TRADE_SCALP = st.sidebar.toggle("Auto-Trade SCALP signals", value=True)
+MAX_TRADE_USD = st.sidebar.slider("Max $ per trade", 1.0, 50.0, 2.0, step=1.0)
 
 if st.sidebar.button("Reset history"):
     db.execute("DELETE FROM pos"); db.execute("DELETE FROM preds"); db.commit(); st.session_state.pop("toasted", None)
@@ -202,11 +191,6 @@ def settle_stat(S, secs, ticks, close_ts):
     R = sum(real) / len(real) if real else S
     return ((L - secs) * R + secs * S) / L, max((secs / L) ** 2 * secs / 3, 0.5)
 
-def vol_ratio(vols):
-    prev = vols[-22:-2]
-    m = sum(prev) / len(prev) if prev else 0
-    return vols[-2] / m if m > 0 else 1.0
-
 def market(series):
     ms = get_kalshi(f"{KALSHI}/markets", series_ticker=series, status="open", limit=20).get("markets", [])
     now = datetime.now(timezone.utc)
@@ -238,36 +222,6 @@ def live_price(asset, product):
         except Exception: pass
     return out
 
-def streak_paused():
-    r = db.execute("SELECT win FROM pos WHERE status!='open' AND kind!='mine' ORDER BY close_time DESC, rowid DESC LIMIT 3").fetchall()
-    return PAUSE_ON and len(r) == 3 and all(x[0] == 0 for x in r)
-
-def grade():
-    now = datetime.now(timezone.utc).isoformat()
-    tks = {r[0] for r in db.execute("SELECT ticker FROM preds WHERE result IS NULL AND close_time < ?", (now,)).fetchall()}
-    tks |= {r[0] for r in db.execute("SELECT ticker FROM pos WHERE status='open' AND close_time < ?", (now,)).fetchall()}
-    for t in list(tks)[:10]:
-        try:
-            res = get_kalshi(f"{KALSHI}/markets/{t}").get("market", {}).get("result")
-            if res in ("yes", "no"):
-                db.execute("UPDATE preds SET result=? WHERE ticker=?", (res, t))
-                for key, side, entry in db.execute("SELECT key,side,entry FROM pos WHERE ticker=? AND status='open'", (t,)).fetchall():
-                    won = res == side; ex = 1.0 if won else 0.0
-                    db.execute("UPDATE pos SET status='settled', exit=?, pnl=?, win=? WHERE key=?",
-                               (ex, (ex - entry) / entry * 100, int(won), key))
-                db.commit()
-        except Exception: pass
-
-def calib():
-    rows = db.execute("SELECT model, kalshi, result FROM preds WHERE result IN ('yes','no') ORDER BY close_time DESC LIMIT 150").fetchall()
-    n = len(rows)
-    if n == 0: return 0.5, None, None, 0
-    ys = [1.0 if r[2] == "yes" else 0.0 for r in rows]
-    bm = sum((r[0] - y) ** 2 for r, y in zip(rows, ys)) / n
-    bk = sum((r[1] - y) ** 2 for r, y in zip(rows, ys)) / n
-    w = min(0.8, max(0.2, 0.5 + 10 * (bk - bm))) if n >= 30 else 0.5
-    return w, bm, bk, n
-
 # ==========================================
 # UI COMPONENTS
 # ==========================================
@@ -293,12 +247,10 @@ def pos_html(p):
     head = f'{kind} {p["side"].upper()} @ {p["entry"]*100:.0f}¢'
     if p["status"] != "open":
         pn = p["pnl"] or 0
-        tag = "settled" if p["status"] == "settled" else "closed"
-        return (f'<div class="cash"><div class="act">✅ {tag.upper()} · {head}</div>Exit {p["exit"]*100:.0f}¢ · '
+        return (f'<div class="cash"><div class="act">✅ SETTLED · {head}</div>Exit {p["exit"]*100:.0f}¢ · '
                 f'<span class="{"up" if pn >= 0 else "dn"}">{pn:+.1f}%</span></div>')
     return (f'<div class="cash {p["cls"]}"><div class="act">{p["act"]}</div>{p["why"]}<br>{head} · exit now {p["bid"]*100:.0f}¢ · '
-            f'<span class="{"up" if p["pnl"] >= 0 else "dn"}">{p["pnl"]:+.1f}%</span><br>'
-            f'Cash-out target <span class="gold">{p["target"]*100:.0f}¢</span></div>')
+            f'<span class="{"up" if p["pnl"] >= 0 else "dn"}">{p["pnl"]:+.1f}%</span></div>')
 
 def card(d):
     a = d["asset"]
@@ -307,8 +259,6 @@ def card(d):
                 f'<div style="color:#fbbf24;font-weight:700;font-size:.95rem">{d["err"][:160]}</div></div>')
     mode, sd_ = d["mode"], d["side"]
     if mode == "safe": bc, bt = sd_, f'{"▲" if sd_ == "yes" else "▼"} SAFE BUY {sd_.upper()} @ {d["price"]*100:.0f}%'
-    elif mode == "early": bc, bt = sd_, f'{"▲" if sd_ == "yes" else "▼"} EARLY BUY {sd_.upper()} @ {d["price"]*100:.0f}%'
-    elif mode == "own": bc, bt = sd_, f'🧠 OWN CALL: BUY {sd_.upper()} @ {d["price"]*100:.0f}%'
     elif mode == "scalp": bc, bt = "scalp", f'⚡ SCALP {sd_.upper()} @ {d["price"]*100:.0f}%'
     elif mode == "retest": bc, bt = "wait", "⏳ WAIT FOR RETEST"
     elif mode == "conflict": bc, bt = "none", "⚠ NO TRADE"
@@ -316,8 +266,7 @@ def card(d):
     s, u, cf = int(d["secs"]), round(d["up"] * 100), d["conf"]
     cl = "HIGH" if cf >= 70 else "MEDIUM" if cf >= 45 else "LOW"
     c1, c2 = ("up" if d["pct"] >= 0 else "dn"), ("up" if d["chg5"] >= 0 else "dn")
-    chips = ("".join(chip(k, v) for k, v in d["votes"].items()) + f'<span class="chip" style="color:#9fb0d0">RSI {d["rsi"]:.0f}</span>'
-             f'<span class="chip" style="color:#9fb0d0">VOL {d["vr"]:.1f}x</span>')
+    chips = ("".join(chip(k, v) for k, v in d["votes"].items()) + f'<span class="chip" style="color:#9fb0d0">RSI {d["rsi"]:.0f}</span>')
     ph = "".join(pos_html(p) for p in d["poss"]) or '<div class="cash">No open position · <b>nothing to cash out</b></div>'
     return "".join([
         f'<div class="card"><div class="hdr"><span><span class="sym">{a}</span><span class="nm">{ASSETS[a][3]}</span></span>',
@@ -337,10 +286,10 @@ def card(d):
         f'<div class="k">Kalshi says</div><div class="val">YES {d["k_yes"]*100:.0f}% / NO {100-d["k_yes"]*100:.0f}%</div>',
         ph,
         f'<div class="tb"><div style="width:{min(d["secs"]/9,100):.0f}%"></div></div>',
-        f'<div class="foot"><span>{d["ticker"]}</span><span>{d["srcs"]} · closes in {s//60}m {s%60}s</span></div></div>'])
+        f'<div class="foot"><span>{d["ticker"]}</span><span>{d["srcs"]}</span></div></div>'])
 
 # ==========================================
-# ANALYSIS LOGIC (With Auto-Trade)
+# ANALYSIS LOGIC
 # ==========================================
 def analyse(asset):
     series, product = ASSETS[asset][0], ASSETS[asset][1]
@@ -350,14 +299,11 @@ def analyse(asset):
     strike, tk, ct = float(m["floor_strike"]), m["ticker"], m["close_time"]
     
     allc, vols, last_ts = candles(product)
-    if time.time() - last_ts > 420: return {"asset": asset, "err": "Price data is stale. Waiting for fresh candles."}
     px = live_price(asset, product)
     spot = sum(px.values()) / len(px) if px else allc[-1]
     
     closed = allc[:-1]
     pct = (spot / strike - 1) * 100
-    if abs(pct) > 2.5: return {"asset": asset, "err": f"Data mismatch: price is {pct:+.1f}% from Kalshi's target."}
-    
     now_ts = time.time()
     tb = st.session_state.setdefault("ticks", {}).setdefault(asset, [])
     tb.append((now_ts, spot)); del tb[:-200]
@@ -375,105 +321,83 @@ def analyse(asset):
     
     ya, na, yb, nb = dollars(m, "yes_ask"), dollars(m, "no_ask"), dollars(m, "yes_bid"), dollars(m, "no_bid")
     k_yes = (yb + ya) / 2 if yb and ya else (ya or 0.5)
-    wm = st.session_state.get("w_model", 0.5) if AUTO_W else MODEL_W
-    sk = st.session_state.get("skill", (None, None, 0))
-    proven = sk[2] >= 30 and sk[0] is not None and sk[0] < sk[1]
-    if FOLLOW and not proven: wm = min(wm, 0.25)
-    up = wm * model + (1 - wm) * k_yes
-    vr = vol_ratio(vols)
+    up = 0.5 * model + 0.5 * k_yes
     
     ds = 1 if up >= 0.5 else -1
     side = "yes" if ds > 0 else "no"
     ask, bid = (ya, yb) if ds > 0 else (na, nb)
     ps = up if ds > 0 else 1 - up
     ready = ask is not None and bid is not None
-    spread = (ask - bid) if ready else 1
     edge = (ps - ask - fee(ask)) if ready else -1
     agree = (z > 0) == (ds > 0) and (k_yes >= 0.5) == (ds > 0)
-    ind_n = sum(1 for v in votes.values() if v == ds)
-
+    
+    # --- SIGNAL GENERATION ---
     mode, plan, price = "wait", "Waiting for price, charts and Kalshi to line up.", None
     
-    # Signal generation
-    if ready and secs >= MIN_SECS and edge >= MIN_EDGE and ask <= PRICE_CAP and agree and ind_n >= 3:
+    # 1. SAFE SIGNAL
+    if ready and secs >= MIN_SECS and edge >= MIN_EDGE and agree:
         mode, price = "safe", ask
         plan = f"Max pay {(ps - MIN_EDGE - fee(ps))*100:.0f}% · target {min(0.93, ask + 0.15)*100:.0f}%"
-    
-    # --- AUTO TRADE EXECUTION ---
-    if mode == "safe" and AUTO_TRADE:
-        existing = db.execute("SELECT 1 FROM pos WHERE key=? AND status='open'", (tk + mode,)).fetchone()
-        if not existing:
-            contracts = int(MAX_TRADE_USD // ask) if ask else 0
-            if contracts >= 1:
-                status, resp = place_order(tk, side, contracts, ask)
-                if status == 201:
-                    st.toast(f"✅ {asset}: AUTO-BOUGHT {contracts}x {side.upper()} @ {ask*100:.0f}%", icon="💰")
-                    db.execute("INSERT OR IGNORE INTO pos(key,ticker,asset,kind,side,entry,peak,close_time,status) VALUES(?,?,?,?,?,?,?,?,'open')",
-                               (tk + mode, tk, asset, mode, side, ask, ask, ct))
-                else:
-                    st.toast(f"❌ Trade Failed: {status}", icon="⚠️")
-    
-    # Record signal for UI
-    if mode in ("own", "safe", "scalp", "early"):
-        db.execute("INSERT OR IGNORE INTO pos(key,ticker,asset,kind,side,entry,peak,close_time,status) VALUES(?,?,?,?,?,?,?,?,'open')",
-                   (tk + mode, tk, asset, mode, side, ask, bid, ct)); db.commit()
+        
+        # Auto Trade SAFE
+        if AUTO_TRADE_SAFE:
+            existing = db.execute("SELECT 1 FROM pos WHERE key=? AND status='open'", (tk + mode,)).fetchone()
+            if not existing:
+                contracts = int(MAX_TRADE_USD // ask) if ask else 0
+                if contracts >= 1:
+                    status, resp = place_order(tk, side, contracts, ask)
+                    if status == 201:
+                        st.toast(f"✅ {asset}: AUTO-BOUGHT SAFE {contracts}x {side.upper()}", icon="💰")
+                        db.execute("INSERT OR IGNORE INTO pos(key,ticker,asset,kind,side,entry,peak,close_time,status) VALUES(?,?,?,?,?,?,?,?,'open')",
+                                   (tk + mode, tk, asset, mode, side, ask, ask, ct))
+                        db.commit()
 
-    poss, newcash = [], []
+    # 2. SCALP SIGNAL (Buy the dip in a trend)
+    elif ready and SCALP_ON and secs >= 120 and abs(z) >= 0.3:
+        # If trend is up (z>0) but RSI is low (oversold), or trend is down (z<0) but RSI is high (overbought)
+        if (z > 0 and rsi_v < 40) or (z < 0 and rsi_v > 60):
+            mode, price = "scalp", ask
+            plan = f"Quick bounce trade · target {(ask + SCALP_TP)*100:.0f}% · stop {(ask - SCALP_SL)*100:.0f}%"
+            
+            # Auto Trade SCALP
+            if AUTO_TRADE_SCALP:
+                existing = db.execute("SELECT 1 FROM pos WHERE key=? AND status='open'", (tk + mode,)).fetchone()
+                if not existing:
+                    contracts = int(MAX_TRADE_USD // ask) if ask else 0
+                    if contracts >= 1:
+                        status, resp = place_order(tk, side, contracts, ask)
+                        if status == 201:
+                            st.toast(f"⚡ {asset}: AUTO-BOUGHT SCALP {contracts}x {side.upper()}", icon="⚡")
+                            db.execute("INSERT OR IGNORE INTO pos(key,ticker,asset,kind,side,entry,peak,close_time,status) VALUES(?,?,?,?,?,?,?,?,'open')",
+                                       (tk + mode, tk, asset, mode, side, ask, ask, ct))
+                            db.commit()
+
+    # --- MANAGE POSITIONS & CASH OUT ---
+    poss = []
     for key, kind, s, entry, peak, status, ex, pn in db.execute(
             "SELECT key,kind,side,entry,peak,status,exit,pnl FROM pos WHERE ticker=?", (tk,)).fetchall():
         if status != "open":
             poss.append(dict(kind=kind, side=s, entry=entry, status=status, exit=ex, pnl=pn)); continue
         b = yb if s == "yes" else nb
         if b is None: continue
-        peak = max(peak or b, b)
         
         pnl = (b - entry) / entry * 100
-        sell_val, hold_val = b - fee(b), up if s == "yes" else 1 - up
-        if b >= 0.95: a = ("💰 CASH OUT NOW", "go", "Almost max payout.")
-        elif pnl > 0 and sell_val >= hold_val - 0.02: a = ("💰 CASH OUT NOW", "go", "Market pays what holding is worth.")
-        elif pnl > 0 and secs <= 60 and (up if s == "yes" else 1 - up) < 0.85: a = ("💰 EXIT NOW", "go", "Under 60s left.")
-        elif (up if s == "yes" else 1 - up) < 0.35 and b > 0.05: a = ("✂️ CUT LOSS", "cut", "Model favors the other side.")
-        else: a = ("✋ HOLD", "", f"Holding (~{hold_val*100:.0f}%) beats selling.")
+        p_side = up if s == "yes" else 1 - up
         
-        db.execute("UPDATE pos SET peak=? WHERE key=?", (peak, key))
-        poss.append(dict(kind=kind, side=s, entry=entry, status="open", bid=b, act=a[0], cls=a[1], why=a[2], pnl=pnl, target=min(0.93, entry+0.15)))
-    db.commit()
+        # Cash out logic
+        if kind == "scalp":
+            if b >= entry + SCALP_TP: a = ("💰 CASH OUT NOW", "go", "Scalp target hit.")
+            elif b <= entry - SCALP_SL: a = ("✂️ STOP OUT", "cut", "Scalp failed.")
+            else: a = ("✋ HOLD", "", "Waiting for target.")
+        else:
+            # If the model flips completely against us, cut the loss
+            if p_side < 0.35 and b > 0.05: a = ("✂️ CUT LOSS", "cut", "Model favors opposite side.")
+            elif b >= 0.93: a = ("💰 CASH OUT NOW", "go", "Almost max payout.")
+            else: a = ("✋ HOLD", "", f"Holding (~{p_side*100:.0f}%) beats selling.")
+            
+        poss.append(dict(kind=kind, side=s, entry=entry, status="open", bid=b, act=a[0], cls=a[1], why=a[2], pnl=pnl))
 
     return dict(asset=asset, ticker=tk, spot=spot, strike=strike, pct=pct, chg5=(spot / allc[-6] - 1) * 100,
                 secs=secs, k_yes=k_yes, up=up, edge=edge * 100, mode=mode, side=side, price=price, plan=plan,
-                conf=min(100, abs(up - 0.5) * 100 + ind_n / len(votes) * 30), votes=votes, rsi=rsi_v, 
-                poss=poss, z=z, vr=vr, srcs="+".join(px) or "Coinbase", closes=allc[-15:])
-
-# ==========================================
-# LIVE DASHBOARD
-# ==========================================
-@st.fragment(run_every=5)
-def live():
-    grade()
-    res = []
-    for a in picked:
-        try: res.append(analyse(a))
-        except Exception as e: res.append({"asset": a, "err": str(e)[:160]})
-        
-    n, wins, avg = db.execute("SELECT COUNT(*), COALESCE(SUM(win),0), COALESCE(AVG(pnl),0) FROM pos WHERE status!='open' AND kind!='mine'").fetchone()
-    op = db.execute("SELECT COUNT(*) FROM pos WHERE status='open'").fetchone()[0]
-    wr = f"{wins/n*100:.1f}%" if n else "—"
-    now = datetime.now(timezone.utc)
-    
-    st.markdown(
-        f'<div class="top"><div><div class="title">⚡ Kalshi 15-Min Crypto Desk</div>'
-        f'<div class="sub">Settlement-aware model · multi-exchange price · self-check · auto-trading enabled</div></div>'
-        f'<div class="live">● LIVE · {now.strftime("%H:%M:%S")} UTC<br><span class="sub">next 1-min candle in {60-now.second}s</span></div></div>'
-        f'<div class="stats"><div class="stat"><div class="l">Win rate</div><div class="v">{wr}</div></div>'
-        f'<div class="stat"><div class="l">Record</div><div class="v">{int(wins)} / {n-int(wins)}</div></div>'
-        f'<div class="stat"><div class="l">Avg result</div><div class="v">{avg:+.1f}%</div></div>'
-        f'<div class="stat"><div class="l">Open pos</div><div class="v">{op}</div></div>'
-        f'<div class="stat"><div class="l">Auto-Trade</div><div class="v" style="color:{"#22c55e" if AUTO_TRADE else "#ef4444"}">{"ON" if AUTO_TRADE else "OFF"}</div></div></div>',
-        unsafe_allow_html=True)
-        
-    cols = st.columns(3)
-    for i, d in enumerate(res):
-        with cols[i % 3]:
-            st.markdown(card(d), unsafe_allow_html=True)
-
-live()
+                conf=min(100, abs(up - 0.5) * 100 + (sum(votes.values()) / 5)*30), votes=votes, rsi=rsi_v, 
+                poss=poss,
