@@ -2,7 +2,6 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 from datetime import datetime, timezone
-import requests
 
 st.set_page_config(page_title="Kalshi 15-Min Desk", page_icon="⚡", layout="wide")
 
@@ -25,11 +24,11 @@ DB_FILE = "calls3.db"
 db = sqlite3.connect(DB_FILE, check_same_thread=False)
 db.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value REAL)")
 
-def get_setting(key, default):
+def get_s(key, default):
     res = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
     return float(res[0]) if res else default
 
-def save_setting(key, val):
+def save_s(key, val):
     db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, val))
     db.commit()
 
@@ -37,24 +36,46 @@ def save_setting(key, val):
 # SIDEBAR SETTINGS
 # ==========================================
 st.sidebar.header("⚙️ Strategy Settings")
-min_edge = st.sidebar.slider("Minimum edge after fees (%)", -10.0, 15.0, get_setting("min_edge", -5.0), step=0.5)
-price_cap = st.sidebar.slider("Max contract price for SAFE buys (%)", 50.0, 99.0, get_setting("price_cap", 90.0), step=1.0)
+min_edge = st.sidebar.slider("Minimum edge after fees (%)", -10.0, 15.0, get_s("min_edge", -5.0) * 100, step=0.5) / 100
+min_secs = st.sidebar.slider("No new entries with less than (sec) left", 30.0, 300.0, get_s("min_secs", 60.0), step=10.0)
+price_cap = st.sidebar.slider("Max contract price for SAFE buys (%)", 50.0, 99.0, get_s("price_cap", 90.0) * 100, step=1.0) / 100
+
+st.sidebar.header("⚡ Scalp Settings")
+scalp_on = st.sidebar.checkbox("Enable SCALP signals", value=(get_s("scalp_on", 1.0) == 1.0))
+scalp_sl = st.sidebar.slider("Scalp stop loss (%)", -20.0, -1.0, get_s("scalp_sl", -6.0) * 100, step=1.0) / 100
+
+st.sidebar.header("💵 Auto-Trading")
+auto_safe = st.sidebar.checkbox("Auto-Trade SAFE signals", value=(get_s("auto_safe", 1.0) == 1.0))
+auto_scalp = st.sidebar.checkbox("Auto-Trade SCALP signals", value=(get_s("auto_scalp", 1.0) == 1.0))
+max_trade_usd = st.sidebar.number_input("Max $ per trade", 1.0, 50.0, get_s("max_trade_usd", 2.0), step=1.0)
 
 st.sidebar.header("💰 Auto-Sell Settings")
-profit_target = st.sidebar.slider("Profit Target (%)", 5.0, 100.0, get_setting("profit_target", 35.0), step=1.0)
-stop_loss = st.sidebar.slider("Stop Loss (%)", -50.0, -5.0, get_setting("stop_loss", -20.0), step=1.0)
-sell_conf = st.sidebar.slider("Sell if confidence drops below (%)", 10.0, 90.0, get_setting("sell_conf", 50.0), step=1.0)
+auto_sell = st.sidebar.checkbox("Enable Auto-Selling", value=(get_s("auto_sell", 1.0) == 1.0))
+profit_target = st.sidebar.slider("Standard Trade Profit Target (%)", 5.0, 100.0, get_s("profit_target", 35.0) * 100, step=1.0) / 100
+sell_conf = st.sidebar.slider("Sell standard if confidence drops below (%)", 10.0, 90.0, get_s("sell_conf", 50.0) * 100, step=1.0) / 100
+stop_loss = st.sidebar.slider("Standard Stop Loss (%)", -50.0, -5.0, get_s("stop_loss", -20.0) * 100, step=1.0) / 100
 
-# Save to database so worker reads them
-save_setting("min_edge", min_edge / 100.0)
-save_setting("price_cap", price_cap / 100.0)
-save_setting("profit_target", profit_target / 100.0)
-save_setting("stop_loss", stop_loss / 100.0)
-save_setting("sell_conf", sell_conf / 100.0)
+st.sidebar.header("🛡️ Safety")
+pause_on = st.sidebar.checkbox("Pause new calls after 3 losses in a row", value=(get_s("pause_on", 1.0) == 1.0))
 
-if st.sidebar.button("Reset History"):
+if st.sidebar.button("Reset history"):
     db.execute("DELETE FROM pos"); db.execute("DELETE FROM preds"); db.commit()
     st.rerun()
+
+# Save to DB
+save_s("min_edge", min_edge)
+save_s("min_secs", min_secs)
+save_s("price_cap", price_cap)
+save_s("scalp_on", 1.0 if scalp_on else 0.0)
+save_s("scalp_sl", scalp_sl)
+save_s("auto_safe", 1.0 if auto_safe else 0.0)
+save_s("auto_scalp", 1.0 if auto_scalp else 0.0)
+save_s("max_trade_usd", max_trade_usd)
+save_s("auto_sell", 1.0 if auto_sell else 0.0)
+save_s("profit_target", profit_target)
+save_s("sell_conf", sell_conf)
+save_s("stop_loss", stop_loss)
+save_s("pause_on", 1.0 if pause_on else 0.0)
 
 # ==========================================
 # DASHBOARD STATS
@@ -85,5 +106,5 @@ st.markdown(
 )
 
 st.subheader("Recent Trades")
-df = pd.read_sql("SELECT asset, side, count, entry, status, pnl FROM pos ORDER BY close_time DESC LIMIT 20", db)
+df = pd.read_sql("SELECT asset, kind, side, count, entry, status, pnl FROM pos ORDER BY close_time DESC LIMIT 20", db)
 st.dataframe(df, use_container_width=True)
