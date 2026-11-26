@@ -13,6 +13,7 @@ except Exception:
 # ==========================================
 KALSHI_KEY_ID = os.environ.get("KALSHI_KEY_ID")
 PEM = os.environ.get("KALSHI_PEM")
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 KALSHI = "https://api.elections.kalshi.com"
 
 if not KALSHI_KEY_ID or not PEM:
@@ -34,7 +35,6 @@ def get_headers(method, path):
 
 def place_order(ticker, side, count, price_dollars, action="buy", tif="immediate_or_cancel"):
     api_side = "bid" if side == "yes" else "ask"
-    
     path = "/trade-api/v2/portfolio/events/orders"
     payload = {
         "ticker": ticker,
@@ -48,10 +48,8 @@ def place_order(ticker, side, count, price_dollars, action="buy", tif="immediate
     }
     headers = get_headers("POST", path)
     res = requests.post(f"{KALSHI}{path}", json=payload, headers=headers, timeout=10)
-    
     if res.status_code != 201:
         print(f"Order Error {res.status_code}: {res.text}")
-        
     return res.status_code, res.text
 
 def get_kalshi(path, **params):
@@ -61,6 +59,26 @@ def get_kalshi(path, **params):
         return r.json()
     except Exception:
         return {}
+
+# ==========================================
+# DISCORD NOTIFICATION FUNCTION
+# ==========================================
+def send_discord_message(title, description, color=0x22c55e):
+    if not DISCORD_WEBHOOK_URL:
+        return
+    try:
+        data = {
+            "embeds": [{
+                "title": title,
+                "description": description,
+                "color": color,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "footer": {"text": "Kalshi 15-Min Bot"}
+            }]
+        }
+        requests.post(DISCORD_WEBHOOK_URL, json=data, timeout=5)
+    except Exception as e:
+        print(f"Discord webhook failed: {e}")
 
 # ==========================================
 # UI STYLING
@@ -163,6 +181,60 @@ if st.sidebar.button("Reset history"):
     db.execute("DELETE FROM pos"); db.execute("DELETE FROM preds"); db.commit(); st.session_state.pop("toasted", None)
 
 # ==========================================
+# CHART PATTERNS
+# ==========================================
+def _pivots(c, k=3):
+    hi, lo = [], []
+    for i in range(k, len(c) - k):
+        w = c[i-k:i+k+1]
+        if c[i] == max(w) and c[i] != c[i-1]: hi.append((i, c[i]))
+        if c[i] == min(w) and c[i] != c[i-1]: lo.append((i, c[i]))
+    return hi, lo
+
+def _slope(p):
+    n = len(p); mx = sum(x for x, _ in p) / n; my = sum(y for _, y in p) / n
+    d = sum((x - mx) ** 2 for x, _ in p) or 1
+    return sum((x - mx) * (y - my) for x, y in p) / d
+
+def _p(name, bias, conf, target=None, inv=None):
+    return dict(name=name, bias=bias, state="CONFIRMED" if conf else "FORMING",
+                adj=bias * (0.06 if conf else 0.025), target=target, inv=inv)
+
+NONE_PAT = dict(name="None", bias=0, state="", adj=0.0, target=None, inv=None)
+
+def _find(c):
+    w = c[-45:]; n = len(w); last = w[-1]
+    rng = max(w) - min(w)
+    if n < 30 or rng <= 0 or rng / last < 0.0008: return NONE_PAT
+    hi, lo = _pivots(w)
+    near = lambda i: n - 1 - i <= 15
+    if len(hi) >= 3 and near(hi[-1][0]):
+        (a, av), (b, bv), (d, dv) = hi[-3:]
+        if bv > av and bv > dv and abs(av - dv) <= 0.2 * rng:
+            neck = (min(w[a:b+1]) + min(w[b:d+1])) / 2
+            return _p("Head & Shoulders", -1, last < neck, neck - (bv - neck), dv)
+    if len(lo) >= 3 and near(lo[-1][0]):
+        (a, av), (b, bv), (d, dv) = lo[-3:]
+        if bv < av and bv < dv and abs(av - dv) <= 0.2 * rng:
+            neck = (max(w[a:b+1]) + max(w[b:d+1])) / 2
+            return _p("Inverse Head & Shoulders", 1, last > neck, neck + (neck - bv), dv)
+    if len(hi) >= 2 and near(hi[-1][0]):
+        (a, av), (d, dv) = hi[-2:]
+        tr = min(w[a:d+1])
+        if d - a >= 5 and abs(av - dv) <= 0.12 * rng and min(av, dv) - tr >= 0.25 * rng:
+            return _p("Double Top (M)", -1, last < tr, tr - (min(av, dv) - tr), max(av, dv))
+    if len(lo) >= 2 and near(lo[-1][0]):
+        (a, av), (d, dv) = lo[-2:]
+        pk = max(w[a:d+1])
+        if d - a >= 5 and abs(av - dv) <= 0.12 * rng and pk - max(av, dv) >= 0.25 * rng:
+            return _p("Double Bottom (W)", 1, last > pk, pk + (pk - max(av, dv)), min(av, dv))
+    return NONE_PAT
+
+def find_pattern(c):
+    try: return _find(c)
+    except Exception: return NONE_PAT
+
+# ==========================================
 # MATH & CORE LOGIC
 # ==========================================
 def cdf(x, df=5):
@@ -238,7 +310,6 @@ def live_price(asset, product):
         except Exception: pass
     return out
 
-# --- CLEAN UP EXPIRED POSITIONS ---
 def grade():
     now = datetime.now(timezone.utc).isoformat()
     tks = {r[0] for r in db.execute("SELECT ticker FROM pos WHERE status='open' AND close_time < ?", (now,)).fetchall()}
@@ -357,6 +428,7 @@ def analyse(asset):
     votes, rsi_v = technicals(closed)
     w = 0.15 + 0.35 * min(secs / 900, 1)
     model = (1 - w) * p_stat + w * (0.5 + 0.25 * sum(votes.values()) / len(votes))
+    pat = find_pattern(closed)
     
     ya, na, yb, nb = dollars(m, "yes_ask"), dollars(m, "no_ask"), dollars(m, "yes_bid"), dollars(m, "no_bid")
     k_yes = (yb + ya) / 2 if yb and ya else (ya or 0.5)
@@ -369,6 +441,8 @@ def analyse(asset):
     ready = ask is not None and bid is not None
     edge = (ps - ask - fee(ask)) if ready else -1
     agree = (z > 0) == (ds > 0) and (k_yes >= 0.5) == (ds > 0)
+    
+    conf = min(100, abs(up - 0.5) * 100 + (sum(votes.values()) / 5)*30)
     
     # --- SIGNAL GENERATION ---
     mode, plan, price = "wait", "Waiting for price, charts and Kalshi to line up.", None
@@ -387,6 +461,23 @@ def analyse(asset):
                     status, resp = place_order(tk, side, contracts, ask, action="buy")
                     if status == 201:
                         st.toast(f"✅ {asset}: AUTO-BOUGHT SAFE {contracts}x {side.upper()}", icon="💰")
+                        if asset == "BTC":
+                            direction = "UP" if up >= 0.5 else "DOWN"
+                            sure_text = "YES, I AM SURE" if conf >= 70 else "NOT SURE"
+                            
+                            votes_text = " | ".join([f"{k}: {'▲ UP' if v == 1 else '▼ DOWN' if v == -1 else '● NEUT'}" for k, v in votes.items()])
+                            rsi_status = "Overbought" if rsi_v > 70 else "Oversold" if rsi_v < 30 else "Neutral"
+                            
+                            desc = (
+                                f"Bought **{contracts}x {side.upper()}** @ **{ask*100:.0f}¢**\n\n"
+                                f"**Prediction:** `{direction}`\n"
+                                f"**Confidence:** `{conf:.0f}%` ({sure_text})\n"
+                                f"**Chart Pattern:** `{pat['name']}` ({pat['state']})\n"
+                                f"**RSI:** `{rsi_v:.1f}` ({rsi_status})\n"
+                                f"**Technicals:** {votes_text}"
+                            )
+                            send_discord_message(f"🟢 BTC SAFE BUY", desc, 0x22c55e)
+
                         db.execute("INSERT OR IGNORE INTO pos(key,ticker,asset,kind,side,count,entry,peak,close_time,status) VALUES(?,?,?,?,?,?,?,?,?,'open')",
                                    (tk + mode, tk, asset, mode, side, contracts, ask, ask, close_str))
                         db.commit()
@@ -397,7 +488,7 @@ def analyse(asset):
     elif ready and SCALP_ON and secs >= 120 and abs(z) >= 0.3:
         if (z > 0 and rsi_v < 40) or (z < 0 and rsi_v > 60):
             mode, price = "scalp", ask
-            plan = f"Quick bounce trade · target {(ask + SCALP_TP)*100:.0f}% · stop {(ask - SCALP_SL)*100:.0f}%"
+            plan = f"Quick bounce trade · target {(ask + 0.06)*100:.0f}% · stop {(ask - SCALP_SL)*100:.0f}%"
             
             # Auto Trade SCALP
             if AUTO_TRADE_SCALP:
@@ -408,6 +499,21 @@ def analyse(asset):
                         status, resp = place_order(tk, side, contracts, ask, action="buy")
                         if status == 201:
                             st.toast(f"⚡ {asset}: AUTO-BOUGHT SCALP {contracts}x {side.upper()}", icon="⚡")
+                            if asset == "BTC":
+                                direction = "UP" if up >= 0.5 else "DOWN"
+                                sure_text = "YES, I AM SURE" if conf >= 70 else "NOT SURE"
+                                votes_text = " | ".join([f"{k}: {'▲ UP' if v == 1 else '▼ DOWN' if v == -1 else '● NEUT'}" for k, v in votes.items()])
+                                rsi_status = "Overbought" if rsi_v > 70 else "Oversold" if rsi_v < 30 else "Neutral"
+                                desc = (
+                                    f"Bought **{contracts}x {side.upper()}** @ **{ask*100:.0f}¢** (Scalp)\n\n"
+                                    f"**Prediction:** `{direction}`\n"
+                                    f"**Confidence:** `{conf:.0f}%` ({sure_text})\n"
+                                    f"**Chart Pattern:** `{pat['name']}` ({pat['state']})\n"
+                                    f"**RSI:** `{rsi_v:.1f}` ({rsi_status})\n"
+                                    f"**Technicals:** {votes_text}"
+                                )
+                                send_discord_message(f"⚡ BTC SCALP BUY", desc, 0x8b5cf6)
+                                
                             db.execute("INSERT OR IGNORE INTO pos(key,ticker,asset,kind,side,count,entry,peak,close_time,status) VALUES(?,?,?,?,?,?,?,?,?,'open')",
                                        (tk + mode, tk, asset, mode, side, contracts, ask, ask, close_str))
                             db.commit()
@@ -424,7 +530,7 @@ def analyse(asset):
         b = yb if s == "yes" else nb
         if b is None: continue
         
-        pnl = (b - entry) / entry * 100 # pnl is a percentage, e.g. 35.0 for 35%
+        pnl = (b - entry) / entry * 100
         p_side = up if s == "yes" else 1 - up
         
         should_sell = False
@@ -433,16 +539,13 @@ def analyse(asset):
         # --- AUTO SELL LOGIC ---
         if AUTO_SELL_ON:
             if kind == "scalp":
-                # Scalp: Sell instantly if we see ANY profit (accounting for fees)
                 if pnl > 1.0: 
                     should_sell = True
                     sell_reason = f"Scalp Profit Secured (+{pnl:.1f}%)"
             else:
-                # Standard: Sell if we hit the profit target slider
                 if pnl >= (STANDARD_PROFIT_TARGET * 100):
                     should_sell = True
                     sell_reason = f"Standard Profit Target Hit ({pnl:.1f}%)"
-                # Or sell if confidence drops significantly while we are in profit
                 elif pnl > 0 and p_side < SELL_CONFIDENCE:
                     should_sell = True
                     sell_reason = "Confidence dropped while in profit"
@@ -452,6 +555,23 @@ def analyse(asset):
             status_sell, resp = place_order(tk, s, c_count or 1, b, action="sell")
             if status_sell == 201:
                 st.toast(f"💰 {asset}: AUTO-SOLD {kind.upper()} {c_count}x {s.upper()} · {sell_reason}", icon="💰")
+                
+                if asset == "BTC":
+                    direction = "UP" if up >= 0.5 else "DOWN"
+                    sure_text = "YES, I AM SURE" if conf >= 70 else "NOT SURE"
+                    votes_text = " | ".join([f"{k}: {'▲ UP' if v == 1 else '▼ DOWN' if v == -1 else '● NEUT'}" for k, v in votes.items()])
+                    rsi_status = "Overbought" if rsi_v > 70 else "Oversold" if rsi_v < 30 else "Neutral"
+                    desc = (
+                        f"Sold **{c_count}x {s.upper()}** @ **{b*100:.0f}¢**\n"
+                        f"**Reason:** {sell_reason}\n\n"
+                        f"**Prediction:** `{direction}`\n"
+                        f"**Confidence:** `{conf:.0f}%` ({sure_text})\n"
+                        f"**Chart Pattern:** `{pat['name']}` ({pat['state']})\n"
+                        f"**RSI:** `{rsi_v:.1f}` ({rsi_status})\n"
+                        f"**Technicals:** {votes_text}"
+                    )
+                    send_discord_message(f"💰 BTC CASH OUT", desc, 0x10b981)
+                
                 db.execute("UPDATE pos SET status='closed', exit=?, pnl=?, win=1 WHERE key=?", (b, pnl, key))
                 db.commit()
                 poss.append(dict(kind=kind, side=s, entry=entry, status="closed", exit=b, pnl=pnl))
@@ -459,9 +579,9 @@ def analyse(asset):
             else:
                 st.toast(f"❌ {asset}: Auto-sell failed {status_sell}", icon="🚨")
 
-        # --- DISPLAY LOGIC (If it didn't auto-sell) ---
+        # --- DISPLAY LOGIC ---
         if kind == "scalp":
-            if b >= entry + SCALP_TP: a = ("💰 CASH OUT NOW", "go", "Scalp target hit.")
+            if b >= entry + 0.06: a = ("💰 CASH OUT NOW", "go", "Scalp target hit.")
             elif b <= entry - SCALP_SL: a = ("✂️ STOP OUT", "cut", "Scalp failed.")
             else: a = ("✋ HOLD", "", "Waiting for target.")
         else:
@@ -474,15 +594,13 @@ def analyse(asset):
 
     return dict(asset=asset, ticker=tk, spot=spot, strike=strike, pct=pct, chg5=(spot / allc[-6] - 1) * 100,
                 secs=secs, k_yes=k_yes, up=up, edge=edge * 100, mode=mode, side=side, price=price, plan=plan,
-                conf=min(100, abs(up - 0.5) * 100 + (sum(votes.values()) / 5)*30), 
-                votes=votes, rsi=rsi_v, poss=poss, srcs="+".join(px) or "Coinbase", closes=allc[-15:])
+                conf=conf, votes=votes, rsi=rsi_v, poss=poss, srcs="+".join(px) or "Coinbase", closes=allc[-15:])
 
 # ==========================================
 # LIVE DASHBOARD
 # ==========================================
 @st.fragment(run_every=5)
 def live():
-    # Clean up old expired trades
     grade()
     
     res = []
