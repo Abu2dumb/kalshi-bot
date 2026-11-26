@@ -126,7 +126,7 @@ def live_price(asset, product):
         except Exception: pass
     return list(out.values())
 
-db = sqlite3.connect("calls3.db", check_same_thread=False)
+db = sqlite3.connect("calls3.db", check_same_thread=False, timeout=30)
 db.execute("""CREATE TABLE IF NOT EXISTS pos(key TEXT PRIMARY KEY, ticker TEXT, asset TEXT, kind TEXT, side TEXT,
 count INTEGER, entry REAL, peak REAL, close_time TEXT, status TEXT, exit REAL, pnl REAL, win INTEGER)""")
 db.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value REAL)")
