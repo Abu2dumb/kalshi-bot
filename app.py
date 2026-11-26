@@ -21,8 +21,16 @@ st.markdown("""<style>
 </style>""", unsafe_allow_html=True)
 
 DB_FILE = "calls3.db"
-db = sqlite3.connect(DB_FILE, check_same_thread=False)
+# ADDED timeout=30 to prevent crashes when worker is writing at the same time
+db = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=30)
+
+# Ensure tables exist just in case the dashboard loads first
+db.execute("""CREATE TABLE IF NOT EXISTS pos(key TEXT PRIMARY KEY, ticker TEXT, asset TEXT, kind TEXT, side TEXT,
+count INTEGER, entry REAL, peak REAL, close_time TEXT, status TEXT, exit REAL, pnl REAL, win INTEGER)""")
 db.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value REAL)")
+db.execute("""CREATE TABLE IF NOT EXISTS preds(ticker TEXT PRIMARY KEY, asset TEXT, model REAL, kalshi REAL,
+final REAL, close_time TEXT, result TEXT)""")
+db.commit()
 
 def get_s(key, default):
     res = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
@@ -59,7 +67,9 @@ st.sidebar.header("🛡️ Safety")
 pause_on = st.sidebar.checkbox("Pause new calls after 3 losses in a row", value=(get_s("pause_on", 1.0) == 1.0))
 
 if st.sidebar.button("Reset history"):
-    db.execute("DELETE FROM pos"); db.execute("DELETE FROM preds"); db.commit()
+    try:
+        db.execute("DELETE FROM pos"); db.execute("DELETE FROM preds"); db.commit()
+    except: pass
     st.rerun()
 
 # Save to DB
@@ -80,9 +90,13 @@ save_s("pause_on", 1.0 if pause_on else 0.0)
 # ==========================================
 # DASHBOARD STATS
 # ==========================================
-n, wins, avg = db.execute("SELECT COUNT(*), COALESCE(SUM(win),0), COALESCE(AVG(pnl),0) FROM pos WHERE status!='open'").fetchone()
-op = db.execute("SELECT COUNT(*) FROM pos WHERE status='open'").fetchone()[0]
-wr = f"{wins/n*100:.1f}%" if n else "—"
+try:
+    n, wins, avg = db.execute("SELECT COUNT(*), COALESCE(SUM(win),0), COALESCE(AVG(pnl),0) FROM pos WHERE status!='open'").fetchone()
+    op = db.execute("SELECT COUNT(*) FROM pos WHERE status='open'").fetchone()[0]
+    wr = f"{wins/n*100:.1f}%" if n else "—"
+except:
+    n, wins, avg, op, wr = 0, 0, 0, 0, "—"
+
 now = datetime.now(timezone.utc)
 
 st.markdown(
@@ -96,7 +110,7 @@ st.markdown(
     </div>
     <div class="stats">
         <div class="stat"><div class="l">Win rate</div><div class="v">{wr}</div></div>
-        <div class="stat"><div class="l">Record</div><div class="v">{int(wins)} / {n-int(wins)}</div></div>
+        <div class="stat"><div class="l">Record</div><div class="v">{int(wins)} / {int(n-wins)}</div></div>
         <div class="stat"><div class="l">Avg result</div><div class="v">{avg:+.1f}%</div></div>
         <div class="stat"><div class="l">Open pos</div><div class="v">{op}</div></div>
         <div class="stat"><div class="l">Engine</div><div class="v" style="color:#22c55e">ONLINE</div></div>
@@ -106,5 +120,8 @@ st.markdown(
 )
 
 st.subheader("Recent Trades")
-df = pd.read_sql("SELECT asset, kind, side, count, entry, status, pnl FROM pos ORDER BY close_time DESC LIMIT 20", db)
-st.dataframe(df, use_container_width=True)
+try:
+    df = pd.read_sql("SELECT asset, kind, side, count, entry, status, pnl FROM pos ORDER BY close_time DESC LIMIT 20", db)
+    st.dataframe(df, use_container_width=True)
+except:
+    st.info("No trades yet.")
