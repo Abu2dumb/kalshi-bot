@@ -1,7 +1,9 @@
-import math, time, json, sqlite3, requests, pandas as pd, streamlit as st, os, base64
+import math, time, json, sqlite3, requests, pandas as pd, streamlit as st, os, base64, uuid
 import streamlit.components.v1 as components
 from datetime import datetime, timezone
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import padding, ed25519
+from cryptography.hazmat.primitives import hashes
 
 try:
     from scipy.stats import t as _t
@@ -9,70 +11,110 @@ except Exception:
     _t = None
 
 # ==========================================
-# CONFIGURATION & AUTHENTICATION
+# CONFIG
 # ==========================================
 KALSHI_KEY_ID = os.environ.get("KALSHI_KEY_ID")
 PEM = os.environ.get("KALSHI_PEM")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
-KALSHI = "https://api.elections.kalshi.com"
+
+# Trading host for orders; elections host is fine for public market data
+KALSHI_TRADE = "https://external-api.kalshi.com"
+KALSHI_DATA = "https://api.elections.kalshi.com"
 
 if not KALSHI_KEY_ID or not PEM:
-    st.error("Missing KALSHI_KEY_ID or KALSHI_PEM environment variables in Fly.io Secrets.")
+    st.error("Missing KALSHI_KEY_ID or KALSHI_PEM in Fly.io Secrets.")
     st.stop()
 
 key = serialization.load_pem_private_key(PEM.encode(), password=None)
 
 def get_headers(method, path):
+    """Sign full path including /trade-api/v2 (no query string)."""
+    path = path.split("?")[0]
     ts = str(int(time.time() * 1000))
-    msg = f"{ts}{method}{path}".encode()
-    sig = key.sign(msg)
+    msg = f"{ts}{method}{path}".encode("utf-8")
+    if isinstance(key, ed25519.Ed25519PrivateKey):
+        sig = key.sign(msg)
+    else:
+        sig = key.sign(
+            msg,
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
+            hashes.SHA256(),
+        )
     return {
         "KALSHI-ACCESS-KEY": KALSHI_KEY_ID,
         "KALSHI-ACCESS-TIMESTAMP": ts,
         "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(),
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
 
 def place_order(ticker, side, count, price_dollars, action="buy", tif="immediate_or_cancel"):
-    api_side = "bid" if side == "yes" else "ask"
+    """
+    Kalshi V2 single YES book:
+      buy YES  -> bid  @ yes_price
+      buy NO   -> ask  @ (1 - no_price)
+      sell YES -> ask  @ yes_price
+      sell NO  -> bid  @ (1 - no_price)
+    No 'action' field on V2 body.
+    """
+    side = (side or "yes").lower()
+    action = (action or "buy").lower()
+    p = float(price_dollars)
+
+    if action == "buy":
+        if side == "yes":
+            api_side, api_price = "bid", p
+        else:
+            api_side, api_price = "ask", 1.0 - p
+    else:
+        if side == "yes":
+            api_side, api_price = "ask", p
+        else:
+            api_side, api_price = "bid", 1.0 - p
+
+    api_price = max(0.01, min(0.99, round(api_price, 4)))
     path = "/trade-api/v2/portfolio/events/orders"
     payload = {
         "ticker": ticker,
-        "client_order_id": f"bot-{int(time.time()*1000)}",
+        "client_order_id": str(uuid.uuid4()),
         "side": api_side,
-        "action": action,
         "count": f"{int(count)}.00",
-        "price": f"{price_dollars:.4f}",
+        "price": f"{api_price:.4f}",
         "time_in_force": tif,
-        "self_trade_prevention_type": "taker_at_cross"
+        "self_trade_prevention_type": "taker_at_cross",
     }
     headers = get_headers("POST", path)
-    res = requests.post(f"{KALSHI}{path}", json=payload, headers=headers, timeout=10)
-    if res.status_code != 201:
-        print(f"Order Error {res.status_code}: {res.text}")
+    res = requests.post(f"{KALSHI_TRADE}{path}", json=payload, headers=headers, timeout=12)
+    msg = f"ORDER {res.status_code} | {side}/{action} | {api_side}@{api_price:.4f} | {res.text[:250]}"
+    print(msg)
+    try:
+        st.session_state["last_order_debug"] = msg
+    except Exception:
+        pass
     return res.status_code, res.text
 
 def get_kalshi(path, **params):
     try:
-        r = requests.get(f"{KALSHI}{path}", params=params,
-                         headers=get_headers("GET", path), timeout=10)
+        r = requests.get(
+            f"{KALSHI_DATA}{path}",
+            params=params,
+            headers=get_headers("GET", path),
+            timeout=10,
+        )
         r.raise_for_status()
         return r.json()
-    except Exception:
+    except Exception as e:
+        print(f"get_kalshi {path}: {e}")
         return {}
 
 # ==========================================
-# DISCORD NOTIFICATION FUNCTION (Rate Limit Safe)
+# DISCORD
 # ==========================================
-def send_discord_message(title, description, color=0x22c55e, tag_everyone=True):
+def send_discord_message(title, description, color=0x22c55e, tag_everyone=False):
     if not DISCORD_WEBHOOK_URL:
         return
-
     cooldown = st.session_state.get("discord_cooldown", 0)
     if time.time() < cooldown:
-        print("Discord cooldown active. Skipping message.")
         return
-
     try:
         payload = {
             "embeds": [{
@@ -80,27 +122,21 @@ def send_discord_message(title, description, color=0x22c55e, tag_everyone=True):
                 "description": description,
                 "color": color,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
-                "footer": {"text": "Kalshi 15-Min Bot"}
+                "footer": {"text": "Kalshi 15-Min Bot"},
             }]
         }
         if tag_everyone:
             payload["content"] = "@everyone"
             payload["allowed_mentions"] = {"parse": ["everyone"]}
-
         r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=5)
-
         if r.status_code == 429:
             retry_after = r.json().get("retry_after", 5)
-            st.session_state["discord_cooldown"] = time.time() + retry_after
-            print(f"Rate limited! Cooling down for {retry_after} seconds.")
-        elif r.status_code >= 400:
-            print(f"Discord Error: {r.status_code} {r.text}")
-
+            st.session_state["discord_cooldown"] = time.time() + float(retry_after)
     except Exception as e:
-        print(f"Discord webhook failed: {e}")
+        print(f"Discord error: {e}")
 
 # ==========================================
-# UI STYLING
+# UI
 # ==========================================
 st.set_page_config(page_title="Kalshi 15-Min Desk", page_icon="⚡", layout="wide")
 st.markdown("""<style>
@@ -111,12 +147,10 @@ st.markdown("""<style>
 .top {display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
 .title {font-size:1.7rem;font-weight:800;color:#e8eefc}
 .sub {color:#7d8aa5;font-size:.85rem}.live {color:#22c55e;font-weight:700;font-size:.8rem;text-align:right}
-.alert {background:linear-gradient(90deg,#14532d,#166534);border:1px solid #22c55e;color:#bbf7d0;border-radius:12px;padding:12px 16px;font-weight:800;margin-bottom:14px}
 .stats {display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:18px}
 .stat {background:#101728;border:1px solid #1f2a40;border-radius:14px;padding:14px 18px}
 .stat .l {color:#7d8aa5;font-size:.72rem;text-transform:uppercase;letter-spacing:.08em}
 .stat .v {color:#e8eefc;font-size:1.5rem;font-weight:800;font-family:'JetBrains Mono',monospace}
-.stat .s {color:#5b6885;font-size:.7rem}
 .card {background:linear-gradient(160deg,#131a29,#0d1320);border:1px solid #1f2a40;border-radius:16px;padding:18px;margin-bottom:16px;box-shadow:0 8px 24px rgba(0,0,0,.35)}
 .hdr {display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
 .sym {font-size:1.25rem;font-weight:800;color:#e8eefc}.nm {color:#7d8aa5;font-size:.8rem;margin-left:8px}
@@ -151,30 +185,33 @@ st.markdown("""<style>
 </style>""", unsafe_allow_html=True)
 
 DB_FILE = "calls3.db"
-db = sqlite3.connect(DB_FILE, check_same_thread=False)
-db.execute("""CREATE TABLE IF NOT EXISTS pos(key TEXT PRIMARY KEY, ticker TEXT, asset TEXT, kind TEXT, side TEXT,
-count INTEGER, entry REAL, peak REAL, close_time TEXT, status TEXT, exit REAL, pnl REAL, win INTEGER)""")
+db = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=30)
+db.execute("""CREATE TABLE IF NOT EXISTS pos(
+    key TEXT PRIMARY KEY, ticker TEXT, asset TEXT, kind TEXT, side TEXT,
+    count INTEGER, entry REAL, peak REAL, close_time TEXT, status TEXT,
+    exit REAL, pnl REAL, win INTEGER)""")
 try:
     db.execute("ALTER TABLE pos ADD COLUMN count INTEGER")
 except sqlite3.OperationalError:
     pass
-
-db.execute("""CREATE TABLE IF NOT EXISTS preds(ticker TEXT PRIMARY KEY, asset TEXT, model REAL, kalshi REAL,
-final REAL, close_time TEXT, result TEXT)""")
+db.execute("""CREATE TABLE IF NOT EXISTS preds(
+    ticker TEXT PRIMARY KEY, asset TEXT, model REAL, kalshi REAL,
+    final REAL, close_time TEXT, result TEXT)""")
+db.commit()
 
 ASSETS = {
-    "BTC": ("KXBTC15M", "BTC-USD", "COINBASE:BTCUSD", "Bitcoin"),
-    "ETH": ("KXETH15M", "ETH-USD", "COINBASE:ETHUSD", "Ethereum"),
-    "SOL": ("KXSOL15M", "SOL-USD", "COINBASE:SOLUSD", "Solana"),
-    "XRP": ("KXXRP15M", "XRP-USD", "COINBASE:XRPUSD", "XRP"),
-    "DOGE": ("KXDOGE15M", "DOGE-USD", "COINBASE:DOGEUSD", "Dogecoin"),
+    "BTC": ("KXBTC15M", "BTC-USD", "Bitcoin"),
+    "ETH": ("KXETH15M", "ETH-USD", "Ethereum"),
+    "SOL": ("KXSOL15M", "SOL-USD", "Solana"),
+    "XRP": ("KXXRP15M", "XRP-USD", "XRP"),
+    "DOGE": ("KXDOGE15M", "DOGE-USD", "Dogecoin"),
 }
 KRAKEN = {"BTC": "XBTUSD", "ETH": "ETHUSD", "SOL": "SOLUSD", "XRP": "XRPUSD", "DOGE": "XDGUSD"}
 
 # ==========================================
-# SIDEBAR SETTINGS
+# SIDEBAR
 # ==========================================
-MIN_EDGE = st.sidebar.slider("Minimum edge after fees (%)", -10, 15, -2) / 100
+MIN_EDGE = st.sidebar.slider("Minimum edge after fees (%)", -10, 15, -5) / 100
 MIN_SECS = st.sidebar.slider("No new entries with less than (sec) left", 30, 300, 60)
 PRICE_CAP = st.sidebar.slider("Max contract price for SAFE buys (%)", 55, 95, 90) / 100
 SCALP_ON = st.sidebar.checkbox("Enable SCALP signals", True)
@@ -198,78 +235,34 @@ SELL_CONFIDENCE = st.sidebar.slider("Sell standard if confidence drops below (%)
 
 st.sidebar.markdown("---")
 st.sidebar.header("💬 Discord Alerts")
-DISCORD_INTERVAL = st.sidebar.slider("Send BTC update every X seconds", 10, 60, 10)
 DISCORD_TAG = st.sidebar.toggle("Tag @everyone in alerts", value=False)
 
 if st.sidebar.button("Reset history"):
-    db.execute("DELETE FROM pos"); db.execute("DELETE FROM preds"); db.commit(); st.session_state.pop("toasted", None)
+    db.execute("DELETE FROM pos")
+    db.execute("DELETE FROM preds")
+    db.commit()
+    for k in list(st.session_state.keys()):
+        if k.startswith("hold_sent_") or k.startswith("retest_sent_"):
+            del st.session_state[k]
+
+if st.session_state.get("last_order_debug"):
+    st.sidebar.caption(f"Last order: {st.session_state['last_order_debug']}")
 
 # ==========================================
-# CHART PATTERNS
-# ==========================================
-def _pivots(c, k=3):
-    hi, lo = [], []
-    for i in range(k, len(c) - k):
-        w = c[i-k:i+k+1]
-        if c[i] == max(w) and c[i] != c[i-1]: hi.append((i, c[i]))
-        if c[i] == min(w) and c[i] != c[i-1]: lo.append((i, c[i]))
-    return hi, lo
-
-def _slope(p):
-    n = len(p); mx = sum(x for x, _ in p) / n; my = sum(y for _, y in p) / n
-    d = sum((x - mx) ** 2 for x, _ in p) or 1
-    return sum((x - mx) * (y - my) for x, y in p) / d
-
-def _p(name, bias, conf, target=None, inv=None):
-    return dict(name=name, bias=bias, state="CONFIRMED" if conf else "FORMING",
-                adj=bias * (0.06 if conf else 0.025), target=target, inv=inv)
-
-NONE_PAT = dict(name="None", bias=0, state="", adj=0.0, target=None, inv=None)
-
-def _find(c):
-    w = c[-45:]; n = len(w); last = w[-1]
-    rng = max(w) - min(w)
-    if n < 30 or rng <= 0 or rng / last < 0.0008: return NONE_PAT
-    hi, lo = _pivots(w)
-    near = lambda i: n - 1 - i <= 15
-    if len(hi) >= 3 and near(hi[-1][0]):
-        (a, av), (b, bv), (d, dv) = hi[-3:]
-        if bv > av and bv > dv and abs(av - dv) <= 0.2 * rng:
-            neck = (min(w[a:b+1]) + min(w[b:d+1])) / 2
-            return _p("Head & Shoulders", -1, last < neck, neck - (bv - neck), dv)
-    if len(lo) >= 3 and near(lo[-1][0]):
-        (a, av), (b, bv), (d, dv) = lo[-3:]
-        if bv < av and bv < dv and abs(av - dv) <= 0.2 * rng:
-            neck = (max(w[a:b+1]) + max(w[b:d+1])) / 2
-            return _p("Inverse Head & Shoulders", 1, last > neck, neck + (neck - bv), dv)
-    if len(hi) >= 2 and near(hi[-1][0]):
-        (a, av), (d, dv) = hi[-2:]
-        tr = min(w[a:d+1])
-        if d - a >= 5 and abs(av - dv) <= 0.12 * rng and min(av, dv) - tr >= 0.25 * rng:
-            return _p("Double Top (M)", -1, last < tr, tr - (min(av, dv) - tr), max(av, dv))
-    if len(lo) >= 2 and near(lo[-1][0]):
-        (a, av), (d, dv) = lo[-2:]
-        pk = max(w[a:d+1])
-        if d - a >= 5 and abs(av - dv) <= 0.12 * rng and pk - max(av, dv) >= 0.25 * rng:
-            return _p("Double Bottom (W)", 1, last > pk, pk + (pk - max(av, dv)), min(av, dv))
-    return NONE_PAT
-
-def find_pattern(c):
-    try: return _find(c)
-    except Exception: return NONE_PAT
-
-# ==========================================
-# MATH & CORE LOGIC
+# MATH
 # ==========================================
 def cdf(x, df=5):
-    if _t is not None: return float(_t.cdf(x * math.sqrt(df / (df - 2)), df))
+    if _t is not None:
+        return float(_t.cdf(x * math.sqrt(df / (df - 2)), df))
     return 0.5 * (1 + math.erf(x / math.sqrt(2)))
 
-def fee(p): return 0.07 * p * (1 - p)
+def fee(p):
+    return 0.07 * p * (1 - p)
 
 def ema(v, n):
     k, out = 2 / (n + 1), [v[0]]
-    for x in v[1:]: out.append(x * k + out[-1] * (1 - k))
+    for x in v[1:]:
+        out.append(x * k + out[-1] * (1 - k))
     return out
 
 def rsi(c, n=14):
@@ -282,23 +275,33 @@ def technicals(closes):
     e9, e21 = ema(closes, 9)[-1], ema(closes, 21)[-1]
     macd = [a - b for a, b in zip(ema(closes, 12), ema(closes, 26))]
     hist = macd[-1] - ema(macd, 9)[-1]
-    r = rsi(closes); mom = closes[-1] / closes[-6] - 1
+    r = rsi(closes)
+    mom = closes[-1] / closes[-6] - 1
     c5 = closes[::-1][::5][::-1]
     htf = (1 if ema(c5, 9)[-1] > ema(c5, 21)[-1] else -1) if len(c5) >= 22 else 0
-    votes = {"EMA": 1 if e9 > e21 else -1, "RSI": 1 if r > 55 else -1 if r < 45 else 0,
-             "MACD": 1 if hist > 0 else -1, "MOM": 1 if mom > 0 else -1, "5M": htf}
+    votes = {
+        "EMA": 1 if e9 > e21 else -1,
+        "RSI": 1 if r > 55 else -1 if r < 45 else 0,
+        "MACD": 1 if hist > 0 else -1,
+        "MOM": 1 if mom > 0 else -1,
+        "5M": htf,
+    }
     return votes, r
 
 def sigma_ps(closes):
     rets = [math.log(b / a) for a, b in zip(closes[-61:], closes[-60:])]
+    if not rets:
+        return 1e-7
     var = rets[0] ** 2
-    for r in rets[1:]: var = 0.94 * var + 0.06 * r * r
+    for r in rets[1:]:
+        var = 0.94 * var + 0.06 * r * r
     slow = math.sqrt(sum(r * r for r in rets) / len(rets))
     return max((0.5 * math.sqrt(var) + 0.5 * slow) / math.sqrt(60), 1e-7)
 
 def settle_stat(S, secs, ticks, close_ts):
     L = 60.0
-    if secs > L: return S, (secs - L) + L / 3
+    if secs > L:
+        return S, (secs - L) + L / 3
     real = [p for t, p in ticks if t >= close_ts - L]
     R = sum(real) / len(real) if real else S
     return ((L - secs) * R + secs * S) / L, max((secs / L) ** 2 * secs / 3, 0.5)
@@ -311,64 +314,99 @@ def market(series):
 
 def dollars(m, k):
     v = m.get(f"{k}_dollars")
-    if v not in (None, ""): return float(v)
+    if v not in (None, ""):
+        return float(v)
     v = m.get(k)
     return float(v) / 100 if v not in (None, "") else None
 
 @st.cache_data(ttl=10)
 def candles(product):
-    c = requests.get(f"https://api.exchange.coinbase.com/products/{product}/candles",
-                     params={"granularity": 60}, timeout=10).json()[:120]
+    c = requests.get(
+        f"https://api.exchange.coinbase.com/products/{product}/candles",
+        params={"granularity": 60},
+        timeout=10,
+    ).json()[:120]
     c = list(reversed(c))
     return [x[4] for x in c], [x[5] for x in c], c[-1][0]
 
 @st.cache_data(ttl=4)
 def live_price(asset, product):
     out = {}
-    try: out["Coinbase"] = float(requests.get(f"https://api.exchange.coinbase.com/products/{product}/ticker", timeout=6).json()["price"])
-    except Exception: pass
+    try:
+        out["Coinbase"] = float(
+            requests.get(f"https://api.exchange.coinbase.com/products/{product}/ticker", timeout=6).json()["price"]
+        )
+    except Exception:
+        pass
     if asset in KRAKEN:
         try:
-            r = requests.get("https://api.kraken.com/0/public/Ticker", params={"pair": KRAKEN[asset]}, timeout=6).json()["result"]
+            r = requests.get(
+                "https://api.kraken.com/0/public/Ticker",
+                params={"pair": KRAKEN[asset]},
+                timeout=6,
+            ).json()["result"]
             out["Kraken"] = float(list(r.values())[0]["c"][0])
-        except Exception: pass
+        except Exception:
+            pass
     return out
 
 def grade():
     now = datetime.now(timezone.utc).isoformat()
-    tks = {r[0] for r in db.execute("SELECT ticker FROM pos WHERE status='open' AND close_time < ?", (now,)).fetchall()}
+    tks = {r[0] for r in db.execute(
+        "SELECT ticker FROM pos WHERE status='open' AND close_time < ?", (now,)
+    ).fetchall()}
     for t in list(tks)[:10]:
         try:
             m = get_kalshi(f"/trade-api/v2/markets/{t}").get("market", {})
             res = m.get("result")
             if res in ("yes", "no", "void"):
-                for key, side, entry in db.execute("SELECT key,side,entry FROM pos WHERE ticker=? AND status='open'", (t,)).fetchall():
+                for key, side, entry in db.execute(
+                    "SELECT key,side,entry FROM pos WHERE ticker=? AND status='open'", (t,)
+                ).fetchall():
                     if res == "void":
-                        db.execute("UPDATE pos SET status='settled', exit=?, pnl=0, win=0 WHERE key=?", (entry, key))
+                        db.execute(
+                            "UPDATE pos SET status='settled', exit=?, pnl=0, win=0 WHERE key=?",
+                            (entry, key),
+                        )
                     else:
                         won = res == side
                         ex = 1.0 if won else 0.0
-                        db.execute("UPDATE pos SET status='settled', exit=?, pnl=?, win=? WHERE key=?",
-                                   (ex, (ex - entry) / entry * 100, int(won), key))
+                        db.execute(
+                            "UPDATE pos SET status='settled', exit=?, pnl=?, win=? WHERE key=?",
+                            (ex, (ex - entry) / entry * 100, int(won), key),
+                        )
                 db.commit()
-        except Exception as e:
-            print(f"Grade error for {t}: {e}")
+        except Exception:
+            pass
+
+def is_paused():
+    if not PAUSE_ON:
+        return False
+    rows = db.execute(
+        "SELECT win FROM pos WHERE status!='open' ORDER BY close_time DESC LIMIT 3"
+    ).fetchall()
+    return len(rows) == 3 and all(r[0] == 0 for r in rows)
 
 # ==========================================
-# UI COMPONENTS
+# UI HELPERS
 # ==========================================
 def spark(vals, lo=None, hi=None, color="#9fb0d0", mid=None):
-    if len(vals) < 2: return '<div class="sub">collecting data…</div>'
-    lo = min(vals) if lo is None else lo; hi = max(vals) if hi is None else hi
-    if mid is not None: lo, hi = min(lo, mid), max(hi, mid)
+    if len(vals) < 2:
+        return '<div class="sub">collecting data…</div>'
+    lo = min(vals) if lo is None else lo
+    hi = max(vals) if hi is None else hi
+    if mid is not None:
+        lo, hi = min(lo, mid), max(hi, mid)
     rng = (hi - lo) or 1e-9
     pts = " ".join(f"{i*260/(len(vals)-1):.1f},{38-(v-lo)/rng*36:.1f}" for i, v in enumerate(vals))
     ml = ""
     if mid is not None:
         y = 38 - (mid - lo) / rng * 36
         ml = f'<line x1="0" x2="260" y1="{y:.1f}" y2="{y:.1f}" stroke="#f5c542" stroke-width="1" stroke-dasharray="4"/>'
-    return (f'<svg viewBox="0 0 260 40" width="100%" height="40" preserveAspectRatio="none">{ml}'
-            f'<polyline fill="none" stroke="{color}" stroke-width="2" points="{pts}"/></svg>')
+    return (
+        f'<svg viewBox="0 0 260 40" width="100%" height="40" preserveAspectRatio="none">{ml}'
+        f'<polyline fill="none" stroke="{color}" stroke-width="2" points="{pts}"/></svg>'
+    )
 
 def chip(n, v):
     c, a = ("#22c55e", "▲") if v > 0 else ("#ef4444", "▼") if v < 0 else ("#7d8aa5", "●")
@@ -379,57 +417,72 @@ def pos_html(p):
     head = f'{kind} {p["side"].upper()} @ {p["entry"]*100:.0f}¢'
     if p["status"] != "open":
         pn = p["pnl"] or 0
-        return (f'<div class="cash"><div class="act">✅ CLOSED · {head}</div>Exit {p["exit"]*100:.0f}¢ · '
-                f'<span class="{"up" if pn >= 0 else "dn"}">{pn:+.1f}%</span></div>')
-    return (f'<div class="cash {p["cls"]}"><div class="act">{p["act"]}</div>{p["why"]}<br>{head} · exit now {p["bid"]*100:.0f}¢ · '
-            f'<span class="{"up" if p["pnl"] >= 0 else "dn"}">{p["pnl"]:+.1f}%</span></div>')
+        return (
+            f'<div class="cash"><div class="act">✅ CLOSED · {head}</div>Exit {p["exit"]*100:.0f}¢ · '
+            f'<span class="{"up" if pn >= 0 else "dn"}">{pn:+.1f}%</span></div>'
+        )
+    return (
+        f'<div class="cash {p["cls"]}"><div class="act">{p["act"]}</div>{p["why"]}<br>{head} · exit now {p["bid"]*100:.0f}¢ · '
+        f'<span class="{"up" if p["pnl"] >= 0 else "dn"}">{p["pnl"]:+.1f}%</span></div>'
+    )
 
 def card(d):
     a = d["asset"]
     if "err" in d:
-        return (f'<div class="card"><div class="hdr"><span class="sym">{a}</span><span class="pill">OFFLINE</span></div>'
-                f'<div style="color:#fbbf24;font-weight:700;font-size:.95rem">{d["err"][:160]}</div></div>')
+        return (
+            f'<div class="card"><div class="hdr"><span class="sym">{a}</span><span class="pill">OFFLINE</span></div>'
+            f'<div style="color:#fbbf24;font-weight:700;font-size:.95rem">{d["err"][:160]}</div></div>'
+        )
     mode, sd_ = d["mode"], d["side"]
-    if mode == "safe": bc, bt = sd_, f'{"▲" if sd_ == "yes" else "▼"} SAFE BUY {sd_.upper()} @ {d["price"]*100:.0f}%'
-    elif mode == "scalp": bc, bt = "scalp", f'⚡ SCALP {sd_.upper()} @ {d["price"]*100:.0f}%'
-    elif mode == "retest": bc, bt = "wait", "⏳ WAIT FOR RETEST"
-    elif mode == "conflict": bc, bt = "none", "⚠ NO TRADE"
-    else: bc, bt = "none", "WAIT · NO TRADE YET"
+    if mode == "safe":
+        bc, bt = sd_, f'{"▲" if sd_ == "yes" else "▼"} SAFE BUY {sd_.upper()} @ {d["price"]*100:.0f}%'
+    elif mode == "scalp":
+        bc, bt = "scalp", f'⚡ SCALP {sd_.upper()} @ {d["price"]*100:.0f}%'
+    elif mode == "retest":
+        bc, bt = "wait", "⏳ WAIT FOR RETEST"
+    else:
+        bc, bt = "none", "WAIT · NO TRADE YET"
     s, u, cf = int(d["secs"]), round(d["up"] * 100), d["conf"]
     cl = "HIGH" if cf >= 70 else "MEDIUM" if cf >= 45 else "LOW"
     c1, c2 = ("up" if d["pct"] >= 0 else "dn"), ("up" if d["chg5"] >= 0 else "dn")
-    chips = ("".join(chip(k, v) for k, v in d["votes"].items()) + f'<span class="chip" style="color:#9fb0d0">RSI {d["rsi"]:.0f}</span>')
+    chips = "".join(chip(k, v) for k, v in d["votes"].items()) + f'<span class="chip" style="color:#9fb0d0">RSI {d["rsi"]:.0f}</span>'
     ph = "".join(pos_html(p) for p in d["poss"]) or '<div class="cash">No open position · <b>nothing to cash out</b></div>'
     return "".join([
-        f'<div class="card"><div class="hdr"><span><span class="sym">{a}</span><span class="nm">{ASSETS[a][3]}</span></span>',
+        f'<div class="card"><div class="hdr"><span><span class="sym">{a}</span><span class="nm">{ASSETS[a][2]}</span></span>',
         f'<span class="pill">⏱ {s//60}:{s%60:02d}</span></div>',
         f'<div class="banner {bc}">{bt}</div><div class="plan">{d["plan"]}</div>',
         f'<div class="price">${d["spot"]:,.4f}</div>',
-        f'<div><span class="{c1}">{"▲" if d["pct"] >= 0 else "▼"} {d["pct"]:+.3f}% vs target</span> &nbsp; <span class="{c2}">{d["chg5"]:+.2f}% (5m)</span></div>',
+        f'<div><span class="{c1}">{"▲" if d["pct"] >= 0 else "▼"} {d["pct"]:+.3f}% vs target</span> &nbsp; '
+        f'<span class="{c2}">{d["chg5"]:+.2f}% (5m)</span></div>',
         f'<div class="bl"><span>Up vs Down</span><span>model prediction</span></div>',
-        f'<div class="tug"><div class="tu" style="width:{u}%">▲ UP {u}%</div><div class="td">DOWN {100-u}% ▼</div><div class="mid"></div></div>',
+        f'<div class="tug"><div class="tu" style="width:{u}%">▲ UP {u}%</div>'
+        f'<div class="td">DOWN {100-u}% ▼</div><div class="mid"></div></div>',
         f'<div class="bl"><span>Confidence</span><span>{cl} · {cf:.0f}%</span></div>',
         f'<div class="cm"><i style="left:calc({cf:.0f}% - 3px)"></i></div>',
         f'<div class="chips">{chips}</div>',
         f'<div class="bl"><span>1-min price vs target</span><span>last 15 min</span></div>',
         spark(d["closes"], color="#22c55e" if d["pct"] >= 0 else "#ef4444", mid=d["strike"]),
         f'<div class="grid"><div><div class="k">Kalshi target</div><div class="val gold">${d["strike"]:,.4f}</div></div>',
-        f'<div><div class="k">Edge after fees</div><div class="val {"up" if d["edge"] > 0 else "dn"}">{d["edge"]:+.1f}%</div></div></div>',
+        f'<div><div class="k">Edge after fees</div>'
+        f'<div class="val {"up" if d["edge"] > 0 else "dn"}">{d["edge"]:+.1f}%</div></div></div>',
         f'<div class="k">Kalshi says</div><div class="val">YES {d["k_yes"]*100:.0f}% / NO {100-d["k_yes"]*100:.0f}%</div>',
         ph,
         f'<div class="tb"><div style="width:{min(d["secs"]/9,100):.0f}%"></div></div>',
-        f'<div class="foot"><span>{d["ticker"]}</span><span>{d["srcs"]}</span></div></div>'])
+        f'<div class="foot"><span>{d["ticker"]}</span><span>{d["srcs"]}</span></div></div>',
+    ])
 
 # ==========================================
-# ANALYSIS LOGIC
+# ANALYSE + TRADE
 # ==========================================
 def analyse(asset):
     series, product = ASSETS[asset][0], ASSETS[asset][1]
     m = market(series)
-    if not m: return {"asset": asset, "err": "No open market right now"}
-    if m.get("floor_strike") is None: return {"asset": asset, "err": "Market has no target price"}
-    strike, tk, ct = float(m["floor_strike"]), m["ticker"], m["close_time"]
+    if not m:
+        return {"asset": asset, "err": "No open market right now"}
+    if m.get("floor_strike") is None:
+        return {"asset": asset, "err": "Market has no target price"}
 
+    strike, tk, ct = float(m["floor_strike"]), m["ticker"], m["close_time"]
     close_dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
     close_str = close_dt.isoformat()
 
@@ -437,11 +490,12 @@ def analyse(asset):
     px = live_price(asset, product)
     spot = sum(px.values()) / len(px) if px else allc[-1]
 
-    closed = allc[:-1]
+    closed = allc[:-1] if len(allc) > 1 else allc
     pct = (spot / strike - 1) * 100
     now_ts = time.time()
     tb = st.session_state.setdefault("ticks", {}).setdefault(asset, [])
-    tb.append((now_ts, spot)); del tb[:-200]
+    tb.append((now_ts, spot))
+    del tb[:-200]
     secs = max(close_dt.timestamp() - now_ts, 1)
 
     sig = sigma_ps(closed)
@@ -450,9 +504,22 @@ def analyse(asset):
     p_stat = cdf(z)
 
     votes, rsi_v = technicals(closed)
+
+    _bull = sum(1 for v in votes.values() if v == 1)
+    _bear = sum(1 for v in votes.values() if v == -1)
+    if _bull >= 4:
+        pat = {"name": "Strong Bull Alignment", "state": "bullish"}
+    elif _bear >= 4:
+        pat = {"name": "Strong Bear Alignment", "state": "bearish"}
+    elif _bull > _bear:
+        pat = {"name": "Mild Bull Bias", "state": "bullish"}
+    elif _bear > _bull:
+        pat = {"name": "Mild Bear Bias", "state": "bearish"}
+    else:
+        pat = {"name": "Mixed / Chop", "state": "neutral"}
+
     w = 0.15 + 0.35 * min(secs / 900, 1)
-    model = (1 - w) * p_stat + w * (0.5 + 0.25 * sum(votes.values()) / len(votes))
-    pat = find_pattern(closed)
+    model = (1 - w) * p_stat + w * (0.5 + 0.25 * sum(votes.values()) / max(len(votes), 1))
 
     ya, na, yb, nb = dollars(m, "yes_ask"), dollars(m, "no_ask"), dollars(m, "yes_bid"), dollars(m, "no_bid")
     k_yes = (yb + ya) / 2 if yb and ya else (ya or 0.5)
@@ -465,188 +532,286 @@ def analyse(asset):
     ready = ask is not None and bid is not None
     edge = (ps - ask - fee(ask)) if ready else -1
     agree = (z > 0) == (ds > 0) and (k_yes >= 0.5) == (ds > 0)
-
     conf = min(100, abs(up - 0.5) * 100 + (sum(votes.values()) / 5) * 30)
 
-    # --- SIGNAL GENERATION ---
     mode, plan, price = "wait", "Waiting for price, charts and Kalshi to line up.", None
+    just_bought = set()
+    paused = is_paused()
 
-    # 1. SAFE SIGNAL
-    if ready and secs >= MIN_SECS and edge >= MIN_EDGE and agree:
+    votes_text = " | ".join(
+        [f"{k}: {'▲ UP' if v == 1 else '▼ DOWN' if v == -1 else '● NEUT'}" for k, v in votes.items()]
+    )
+    rsi_status = "Overbought" if rsi_v > 70 else "Oversold" if rsi_v < 30 else "Neutral"
+    direction = "UP" if up >= 0.5 else "DOWN"
+    sure_text = "YES, I AM SURE" if conf >= 70 else "NOT SURE"
+
+    # ----- SAFE BUY -----
+    if (
+        ready
+        and not paused
+        and secs >= MIN_SECS
+        and edge >= MIN_EDGE
+        and agree
+        and ask <= PRICE_CAP
+    ):
         mode, price = "safe", ask
         plan = f"Max pay {(ps - MIN_EDGE - fee(ps))*100:.0f}% · target {min(0.93, ask + 0.15)*100:.0f}%"
 
         if AUTO_TRADE_SAFE:
-            existing = db.execute("SELECT 1 FROM pos WHERE key=? AND status='open'", (tk + mode,)).fetchone()
+            existing = db.execute(
+                "SELECT 1 FROM pos WHERE key=? AND status='open'", (tk + "safe",)
+            ).fetchone()
             if not existing:
                 contracts = int(MAX_TRADE_USD // ask) if ask else 0
                 if contracts >= 1:
                     status, resp = place_order(tk, side, contracts, ask, action="buy")
                     if status == 201:
+                        just_bought.add(tk + "safe")
                         st.toast(f"✅ {asset}: AUTO-BOUGHT SAFE {contracts}x {side.upper()}", icon="💰")
                         if asset == "BTC":
-                            direction = "UP" if up >= 0.5 else "DOWN"
-                            sure_text = "YES, I AM SURE" if conf >= 70 else "NOT SURE"
-                            votes_text = " | ".join([f"{k}: {'▲ UP' if v == 1 else '▼ DOWN' if v == -1 else '● NEUT'}" for k, v in votes.items()])
-                            rsi_status = "Overbought" if rsi_v > 70 else "Oversold" if rsi_v < 30 else "Neutral"
-                            # --- Get Last Market Result ---
-                            last_res = db.execute("SELECT ticker, result FROM preds WHERE result IS NOT NULL ORDER BY close_time DESC LIMIT 1").fetchone()
-                            last_msg = f"\n**Last Market:** {last_res[0]} ended **{last_res[1].upper()}** · Bot was {'RIGHT ✅' if last_res[1] == side else 'WRONG ❌'}" if last_res else ""
+                            target_px = min(0.93, ask + 0.15)
                             desc = (
-                                f"Bought **{contracts}x {side.upper()}** @ **{ask*100:.0f}¢**\n\n"
+                                f"**BUY** {contracts}x **{side.upper()}** @ **{ask*100:.0f}¢** ({ask*100:.0f}%)\n"
+                                f"**Cash out target:** {target_px*100:.0f}¢ ({target_px*100:.0f}%)\n\n"
                                 f"**Prediction:** `{direction}`\n"
                                 f"**Confidence:** `{conf:.0f}%` ({sure_text})\n"
                                 f"**Chart Pattern:** `{pat['name']}` ({pat['state']})\n"
                                 f"**RSI:** `{rsi_v:.1f}` ({rsi_status})\n"
-                                f"**Technicals:** {votes_text}{last_msg}"
+                                f"**Technicals:** {votes_text}"
                             )
-                            send_discord_message(f"🟢 BTC SAFE BUY", desc, 0x22c55e, tag_everyone=DISCORD_TAG)
-
-                        db.execute("INSERT OR IGNORE INTO pos(key,ticker,asset,kind,side,count,entry,peak,close_time,status) VALUES(?,?,?,?,?,?,?,?,?,'open')",
-                                   (tk + mode, tk, asset, mode, side, contracts, ask, ask, close_str))
+                            send_discord_message("🟢 BTC SAFE BUY", desc, 0x22c55e, tag_everyone=DISCORD_TAG)
+                        db.execute(
+                            "INSERT OR IGNORE INTO pos(key,ticker,asset,kind,side,count,entry,peak,close_time,status) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,'open')",
+                            (tk + "safe", tk, asset, "safe", side, contracts, ask, ask, close_str),
+                        )
                         db.commit()
                     else:
                         st.toast(f"❌ {asset}: Order failed {status}", icon="🚨")
 
-    # 2. SCALP SIGNAL
-    elif ready and SCALP_ON and secs >= 120 and abs(z) >= 0.3:
+    # ----- SCALP -----
+    elif ready and not paused and SCALP_ON and secs >= 120 and abs(z) >= 0.3:
         if (z > 0 and rsi_v < 40) or (z < 0 and rsi_v > 60):
             mode, price = "scalp", ask
-            plan = f"Quick bounce trade · target {(ask + 0.06)*100:.0f}% · stop {(ask - SCALP_SL)*100:.0f}%"
+            scalp_target = ask + 0.06
+            scalp_stop = ask - SCALP_SL
+            plan = f"Quick bounce · target {scalp_target*100:.0f}% · stop {scalp_stop*100:.0f}%"
 
             if AUTO_TRADE_SCALP:
-                existing = db.execute("SELECT 1 FROM pos WHERE key=? AND status='open'", (tk + mode,)).fetchone()
+                existing = db.execute(
+                    "SELECT 1 FROM pos WHERE key=? AND status='open'", (tk + "scalp",)
+                ).fetchone()
                 if not existing:
                     contracts = int(MAX_TRADE_USD // ask) if ask else 0
                     if contracts >= 1:
                         status, resp = place_order(tk, side, contracts, ask, action="buy")
                         if status == 201:
+                            just_bought.add(tk + "scalp")
                             st.toast(f"⚡ {asset}: AUTO-BOUGHT SCALP {contracts}x {side.upper()}", icon="⚡")
                             if asset == "BTC":
-                                direction = "UP" if up >= 0.5 else "DOWN"
-                                sure_text = "YES, I AM SURE" if conf >= 70 else "NOT SURE"
-                                votes_text = " | ".join([f"{k}: {'▲ UP' if v == 1 else '▼ DOWN' if v == -1 else '● NEUT'}" for k, v in votes.items()])
-                                rsi_status = "Overbought" if rsi_v > 70 else "Oversold" if rsi_v < 30 else "Neutral"
-                                last_res = db.execute("SELECT ticker, result FROM preds WHERE result IS NOT NULL ORDER BY close_time DESC LIMIT 1").fetchone()
-                                last_msg = f"\n**Last Market:** {last_res[0]} ended **{last_res[1].upper()}** · Bot was {'RIGHT ✅' if last_res[1] == side else 'WRONG ❌'}" if last_res else ""
                                 desc = (
-                                    f"Bought **{contracts}x {side.upper()}** @ **{ask*100:.0f}¢** (Scalp)\n\n"
+                                    f"⚡ **SCALP BUY INCOMING**\n\n"
+                                    f"**Buy at:** {ask*100:.0f}¢ ({ask*100:.0f}%)\n"
+                                    f"**Cash out at:** {scalp_target*100:.0f}¢ ({scalp_target*100:.0f}%) — +6¢ target\n"
+                                    f"**Stop loss:** {scalp_stop*100:.0f}¢ ({scalp_stop*100:.0f}%) — -{SCALP_SL*100:.0f}¢\n\n"
+                                    f"Bought **{contracts}x {side.upper()}** @ **{ask*100:.0f}¢**\n"
                                     f"**Prediction:** `{direction}`\n"
                                     f"**Confidence:** `{conf:.0f}%` ({sure_text})\n"
                                     f"**Chart Pattern:** `{pat['name']}` ({pat['state']})\n"
                                     f"**RSI:** `{rsi_v:.1f}` ({rsi_status})\n"
-                                    f"**Technicals:** {votes_text}{last_msg}"
+                                    f"**Technicals:** {votes_text}"
                                 )
-                                send_discord_message(f"⚡ BTC SCALP BUY", desc, 0x8b5cf6, tag_everyone=DISCORD_TAG)
-
-                            db.execute("INSERT OR IGNORE INTO pos(key,ticker,asset,kind,side,count,entry,peak,close_time,status) VALUES(?,?,?,?,?,?,?,?,?,'open')",
-                                       (tk + mode, tk, asset, mode, side, contracts, ask, ask, close_str))
+                                send_discord_message(
+                                    "⚡ BTC SCALP BUY INCOMING", desc, 0x8b5cf6, tag_everyone=DISCORD_TAG
+                                )
+                            db.execute(
+                                "INSERT OR IGNORE INTO pos(key,ticker,asset,kind,side,count,entry,peak,close_time,status) "
+                                "VALUES(?,?,?,?,?,?,?,?,?,'open')",
+                                (tk + "scalp", tk, asset, "scalp", side, contracts, ask, ask, close_str),
+                            )
                             db.commit()
                         else:
-                            st.toast(f"❌ {asset}: Scalp Order failed {status}", icon="🚨")
+                            st.toast(f"❌ {asset}: Scalp order failed {status}", icon="🚨")
 
-    # --- MANAGE POSITIONS & CASH OUT ---
+    # ----- WAIT FOR RETEST -----
+    elif ready and agree and edge < MIN_EDGE:
+        mode, price = "retest", ask
+        plan = f"Direction {direction} · edge {edge*100:+.1f}% < {MIN_EDGE*100:+.1f}% · wait for better entry"
+        if asset == "BTC":
+            retest_key = f"retest_sent_{asset}"
+            if not st.session_state.get(retest_key):
+                desc = (
+                    f"**WAIT FOR RETEST** ⏳\n\n"
+                    f"**Direction:** `{direction}` (model & Kalshi agree)\n"
+                    f"**Ask:** {ask*100:.0f}¢\n"
+                    f"**Current edge:** {edge*100:+.1f}% (need {MIN_EDGE*100:+.1f}%)\n\n"
+                    f"**Confidence:** `{conf:.0f}%`\n"
+                    f"**Chart Pattern:** `{pat['name']}` ({pat['state']})\n"
+                    f"**RSI:** `{rsi_v:.1f}` ({rsi_status})\n"
+                    f"**Technicals:** {votes_text}\n\n"
+                    f"_Fires as **SAFE BUY** when edge improves._"
+                )
+                send_discord_message("⏳ BTC WAIT FOR RETEST", desc, 0xfbbf24, tag_everyone=DISCORD_TAG)
+                st.session_state[retest_key] = True
+
+    if mode != "retest":
+        st.session_state[f"retest_sent_{asset}"] = False
+
+    # ----- MANAGE POSITIONS -----
     poss = []
     for key, kind, s, c_count, entry, peak, status, ex, pn in db.execute(
-            "SELECT key,kind,side,count,entry,peak,status,exit,pnl FROM pos WHERE ticker=?", (tk,)).fetchall():
+        "SELECT key,kind,side,count,entry,peak,status,exit,pnl FROM pos WHERE ticker=?", (tk,)
+    ).fetchall():
         if status != "open":
-            poss.append(dict(kind=kind, side=s, entry=entry, status=status, exit=ex, pnl=pn)); continue
+            poss.append(dict(kind=kind, side=s, entry=entry, status=status, exit=ex, pnl=pn))
+            continue
 
         b = yb if s == "yes" else nb
-        if b is None: continue
+        if b is None:
+            continue
 
         pnl = (b - entry) / entry * 100
         p_side = up if s == "yes" else 1 - up
 
         should_sell = False
         sell_reason = ""
-
         if AUTO_SELL_ON:
             if kind == "scalp":
                 if pnl > 1.0:
-                    should_sell = True
-                    sell_reason = f"Scalp Profit Secured (+{pnl:.1f}%)"
+                    should_sell, sell_reason = True, f"Scalp Profit Secured (+{pnl:.1f}%)"
+                elif pnl <= -SCALP_SL * 100:
+                    should_sell, sell_reason = True, f"Scalp Stop ({pnl:.1f}%)"
             else:
-                if pnl >= (STANDARD_PROFIT_TARGET * 100):
-                    should_sell = True
-                    sell_reason = f"Standard Profit Target Hit ({pnl:.1f}%)"
+                if pnl >= STANDARD_PROFIT_TARGET * 100:
+                    should_sell, sell_reason = True, f"Standard Profit Target Hit ({pnl:.1f}%)"
                 elif pnl > 0 and p_side < SELL_CONFIDENCE:
-                    should_sell = True
-                    sell_reason = "Confidence dropped while in profit"
+                    should_sell, sell_reason = True, "Confidence dropped while in profit"
 
         if should_sell:
             status_sell, resp = place_order(tk, s, c_count or 1, b, action="sell")
             if status_sell == 201:
-                st.toast(f"💰 {asset}: AUTO-SOLD {kind.upper()} {c_count}x {s.upper()} · {sell_reason}", icon="💰")
+                st.toast(f"💰 {asset}: AUTO-SOLD {kind.upper()} · {sell_reason}", icon="💰")
                 if asset == "BTC":
-                    direction = "UP" if up >= 0.5 else "DOWN"
-                    sure_text = "YES, I AM SURE" if conf >= 70 else "NOT SURE"
-                    votes_text = " | ".join([f"{k}: {'▲ UP' if v == 1 else '▼ DOWN' if v == -1 else '● NEUT'}" for k, v in votes.items()])
-                    rsi_status = "Overbought" if rsi_v > 70 else "Oversold" if rsi_v < 30 else "Neutral"
-                    last_res = db.execute("SELECT ticker, result FROM preds WHERE result IS NOT NULL ORDER BY close_time DESC LIMIT 1").fetchone()
-                    last_msg = f"\n**Last Market:** {last_res[0]} ended **{last_res[1].upper()}** · Bot was {'RIGHT ✅' if last_res[1] == side else 'WRONG ❌'}" if last_res else ""
                     desc = (
-                        f"Sold **{c_count}x {s.upper()}** @ **{b*100:.0f}¢**\n"
+                        f"**SELL / CASH OUT AT PROFIT** 💰\n\n"
+                        f"**Bought at:** {entry*100:.0f}¢ ({entry*100:.0f}%)\n"
+                        f"**Cash out at:** {b*100:.0f}¢ ({b*100:.0f}%)\n"
+                        f"**Profit:** `{pnl:+.1f}%`\n"
                         f"**Reason:** {sell_reason}\n\n"
+                        f"Sold **{c_count or 1}x {s.upper()}** @ **{b*100:.0f}¢**\n"
                         f"**Prediction:** `{direction}`\n"
                         f"**Confidence:** `{conf:.0f}%` ({sure_text})\n"
                         f"**Chart Pattern:** `{pat['name']}` ({pat['state']})\n"
                         f"**RSI:** `{rsi_v:.1f}` ({rsi_status})\n"
-                        f"**Technicals:** {votes_text}{last_msg}"
+                        f"**Technicals:** {votes_text}"
                     )
-                    send_discord_message(f"💰 BTC CASH OUT", desc, 0x10b981, tag_everyone=DISCORD_TAG)
-
-                db.execute("UPDATE pos SET status='closed', exit=?, pnl=?, win=1 WHERE key=?", (b, pnl, key))
+                    send_discord_message(
+                        "💰 BTC CASH OUT AT PROFIT", desc, 0x10b981 if pnl >= 0 else 0xef4444,
+                        tag_everyone=DISCORD_TAG,
+                    )
+                db.execute(
+                    "UPDATE pos SET status='closed', exit=?, pnl=?, win=? WHERE key=?",
+                    (b, pnl, 1 if pnl >= 0 else 0, key),
+                )
                 db.commit()
                 poss.append(dict(kind=kind, side=s, entry=entry, status="closed", exit=b, pnl=pnl))
+                st.session_state.pop(f"hold_sent_{key}", None)
                 continue
             else:
                 st.toast(f"❌ {asset}: Auto-sell failed {status_sell}", icon="🚨")
 
         if kind == "scalp":
-            if b >= entry + 0.06: a = ("💰 CASH OUT NOW", "go", "Scalp target hit.")
-            elif b <= entry - SCALP_SL: a = ("✂️ STOP OUT", "cut", "Scalp failed.")
-            else: a = ("✋ HOLD", "", "Waiting for target.")
+            if b >= entry + 0.06:
+                a = ("💰 CASH OUT NOW", "go", "Scalp target hit.")
+            elif b <= entry - SCALP_SL:
+                a = ("✂️ STOP OUT", "cut", "Scalp failed.")
+            else:
+                a = ("✋ HOLD", "", "Waiting for target.")
         else:
-            if p_side < 0.35 and b > 0.05: a = ("✂️ CUT LOSS", "cut", "Model favors opposite side.")
-            elif pnl >= (STANDARD_PROFIT_TARGET * 100): a = ("💰 CASH OUT NOW", "go", "Profit target hit.")
-            elif pnl > 0 and p_side < SELL_CONFIDENCE: a = ("💰 SELL NOW", "go", "Confidence dropped below sell threshold.")
-            else: a = ("✋ HOLD", "", f"Holding (~{p_side*100:.0f}%) beats selling.")
+            if p_side < 0.35 and b > 0.05:
+                a = ("✂️ CUT LOSS", "cut", "Model favors opposite side.")
+            elif pnl >= STANDARD_PROFIT_TARGET * 100:
+                a = ("💰 CASH OUT NOW", "go", "Profit target hit.")
+            elif pnl > 0 and p_side < SELL_CONFIDENCE:
+                a = ("💰 SELL NOW", "go", "Confidence dropped below sell threshold.")
+            else:
+                a = ("✋ HOLD", "", f"Holding (~{p_side*100:.0f}%) beats selling.")
 
-        poss.append(dict(kind=kind, side=s, entry=entry, status="open", bid=b, act=a[0], cls=a[1], why=a[2], pnl=pnl))
+        if a[0] == "✋ HOLD" and asset == "BTC" and key not in just_bought:
+            hold_key = f"hold_sent_{key}"
+            if not st.session_state.get(hold_key):
+                desc = (
+                    f"**HOLD** ✋\n\n"
+                    f"Holding **{c_count or 1}x {s.upper()}** @ **{entry*100:.0f}¢**\n"
+                    f"**Current bid:** {b*100:.0f}¢ ({pnl:+.1f}%)\n"
+                    f"**Prediction:** `{direction}` ({conf:.0f}%)\n\n"
+                    f"**Chart Pattern:** `{pat['name']}` ({pat['state']})\n"
+                    f"**RSI:** `{rsi_v:.1f}` ({rsi_status})\n"
+                    f"**Technicals:** {votes_text}\n\n"
+                    f"_{a[2]}_"
+                )
+                send_discord_message("✋ BTC HOLD", desc, 0x9fb0d0, tag_everyone=DISCORD_TAG)
+                st.session_state[hold_key] = True
 
-    return dict(asset=asset, ticker=tk, spot=spot, strike=strike, pct=pct, chg5=(spot / allc[-6] - 1) * 100,
-                secs=secs, k_yes=k_yes, up=up, edge=edge * 100, mode=mode, side=side, price=price, plan=plan,
-                conf=conf, votes=votes, rsi=rsi_v, poss=poss, srcs="+".join(px) or "Coinbase", closes=allc[-15:])
+        poss.append(
+            dict(kind=kind, side=s, entry=entry, status="open", bid=b, act=a[0], cls=a[1], why=a[2], pnl=pnl)
+        )
+
+    return dict(
+        asset=asset,
+        ticker=tk,
+        spot=spot,
+        strike=strike,
+        pct=pct,
+        chg5=(spot / allc[-6] - 1) * 100 if len(allc) >= 6 else 0,
+        secs=secs,
+        k_yes=k_yes,
+        up=up,
+        edge=edge * 100,
+        mode=mode,
+        side=side,
+        price=price,
+        plan=plan,
+        conf=conf,
+        votes=votes,
+        rsi=rsi_v,
+        poss=poss,
+        srcs="+".join(px) or "Coinbase",
+        closes=allc[-15:],
+    )
 
 # ==========================================
-# LIVE DASHBOARD
+# LIVE (15s)
 # ==========================================
-@st.fragment(run_every=5)
+@st.fragment(run_every=15)
 def live():
     grade()
-
     res = []
     for a in ASSETS:
-        try: res.append(analyse(a))
-        except Exception as e: res.append({"asset": a, "err": str(e)[:160]})
+        try:
+            res.append(analyse(a))
+        except Exception as e:
+            res.append({"asset": a, "err": str(e)[:160]})
 
-    n, wins, avg = db.execute("SELECT COUNT(*), COALESCE(SUM(win),0), COALESCE(AVG(pnl),0) FROM pos WHERE status!='open'").fetchone()
+    n, wins, avg = db.execute(
+        "SELECT COUNT(*), COALESCE(SUM(win),0), COALESCE(AVG(pnl),0) FROM pos WHERE status!='open'"
+    ).fetchone()
     op = db.execute("SELECT COUNT(*) FROM pos WHERE status='open'").fetchone()[0]
     wr = f"{wins/n*100:.1f}%" if n else "—"
     now = datetime.now(timezone.utc)
-
     auto_color = "#22c55e" if AUTO_TRADE_SAFE else "#ef4444"
     auto_text = "ON" if AUTO_TRADE_SAFE else "OFF"
+    paused_note = " · PAUSED (3 losses)" if is_paused() else ""
 
     st.markdown(
         f"""
         <div class="top">
             <div>
                 <div class="title">⚡ Kalshi 15-Min Crypto Desk</div>
-                <div class="sub">Settlement-aware model · multi-exchange price · self-check · auto-trading enabled</div>
+                <div class="sub">Settlement-aware · multi-exchange · auto-trade · Discord alerts{paused_note}</div>
             </div>
-            <div class="live">● LIVE · {now.strftime("%H:%M:%S")} UTC<br><span class="sub">next 1-min candle in {60-now.second}s</span></div>
+            <div class="live">● LIVE · {now.strftime("%H:%M:%S")} UTC<br>
+            <span class="sub">refresh every 15s · keep tab open</span></div>
         </div>
         <div class="stats">
             <div class="stat"><div class="l">Win rate</div><div class="v">{wr}</div></div>
@@ -656,7 +821,7 @@ def live():
             <div class="stat"><div class="l">Auto-Trade</div><div class="v" style="color:{auto_color}">{auto_text}</div></div>
         </div>
         """,
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
     cols = st.columns(3)
