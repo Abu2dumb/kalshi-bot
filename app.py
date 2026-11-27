@@ -60,17 +60,17 @@ st.sidebar.title("Settings")
 AUTO_TRADE = st.sidebar.toggle("Auto Trade (OFF = log signals only)", value=False)
 
 st.sidebar.subheader("Entry rules")
-MIN_EDGE = st.sidebar.slider("Minimum edge after fees (¢)", 1, 15, 3) / 100
-MIN_SECS_LEFT = st.sidebar.slider("No new entries with less than (sec) left", 30, 300, 90)
-SAFE_MAX_PRICE = st.sidebar.slider("Max contract price for SAFE buys (¢)", 55, 90, 78) / 100
+MIN_EDGE = st.sidebar.slider("Minimum edge after fees (%)", 1, 15, 4) / 100
+MIN_SECS_LEFT = st.sidebar.slider("No new entries with less than (sec) left", 30, 300, 120)
+SAFE_MAX_PRICE = st.sidebar.slider("Max contract price for SAFE buys (%)", 55, 90, 72) / 100
 SCALP_ON = st.sidebar.toggle("Enable SCALP signals", value=False)
-SCALP_TP = st.sidebar.slider("Scalp profit target (¢)", 3, 15, 6) / 100
-SCALP_SL = st.sidebar.slider("Scalp stop loss (¢)", 4, 12, 6) / 100
+SCALP_TP = st.sidebar.slider("Scalp profit target (%)", 3, 15, 6) / 100
+SCALP_SL = st.sidebar.slider("Scalp stop loss (%)", 4, 12, 6) / 100
 
 st.sidebar.subheader("Sizing")
 BANKROLL = st.sidebar.number_input("Bankroll for stake suggestions ($)", 5.0, 10000.0, 20.0, step=5.0)
-KELLY = st.sidebar.slider("Kelly fraction (smaller = safer)", 0.05, 0.50, 0.25, step=0.05)
-MAX_STAKE_PCT = st.sidebar.slider("Max stake per trade (% of bankroll)", 1, 10, 4) / 100
+KELLY = st.sidebar.slider("Kelly fraction (smaller = safer)", 0.05, 0.50, 0.15, step=0.05)
+MAX_STAKE_PCT = st.sidebar.slider("Max stake per trade (% of bankroll)", 1, 10, 5) / 100
 BET_MIN, BET_MAX = st.sidebar.slider("Price per bet range: min / max ($)", 0.5, 30.0, (1.0, 2.0), step=0.5)
 FIXED_BET = st.sidebar.toggle("Always bet the max amount (skip Kelly)", value=False)
 MAX_CONTRACTS = st.sidebar.slider("Max contracts per trade", 1, 8, 3)
@@ -80,19 +80,19 @@ PAUSE_ON_LOSSES = st.sidebar.toggle("Pause new calls after 3 losses in a row", v
 FOLLOW_KALSHI = st.sidebar.toggle(
     "Follow Kalshi unless the bot has proven it is more accurate", value=True)
 NEVER_AGAINST = st.sidebar.slider(
-    "Never go against Kalshi when it is this sure (%)", 60, 95, 75) / 100
-SHRINK = st.sidebar.slider("Trust market over model %", 0, 100, 60) / 100
-MAX_EDGE = st.sidebar.slider("Skip if edge above (¢) - likely model error", 6, 30, 10) / 100
+    "Never go against Kalshi when it is this sure (%)", 60, 95, 70) / 100
+SHRINK = st.sidebar.slider("Trust market over model %", 0, 100, 70) / 100
+MAX_EDGE = st.sidebar.slider("Skip if edge above (%) - likely model error", 6, 30, 8) / 100
 
 st.sidebar.subheader("Exits for SAFE trades")
-TAKE_PROFIT = st.sidebar.slider("Take Profit %", 8, 30, 16) / 100
-STOP_LOSS = st.sidebar.slider("Stop Loss %", -20, -5, -10) / 100
-FORCE_CLOSE_SECS = st.sidebar.slider("Force close under (seconds)", 20, 60, 35)
+TAKE_PROFIT = st.sidebar.slider("Take Profit %", 8, 30, 20) / 100
+STOP_LOSS = st.sidebar.slider("Stop Loss %", -20, -5, -20) / 100
+FORCE_CLOSE_SECS = st.sidebar.slider("Force close under (seconds)", 20, 60, 40)
 FLIP_EXIT = st.sidebar.slider(
-    "Exit if my side's win chance drops below %", 25, 50, 42) / 100
+    "Exit if my side's win chance drops below %", 25, 50, 40) / 100
 PROFIT_LOCK = st.sidebar.slider(
     "Lock profit if my side's win chance below %", 40, 60, 50) / 100
-MIN_HOLD = st.sidebar.slider("Min hold before flip exit (sec)", 0, 90, 25)
+MIN_HOLD = st.sidebar.slider("Min hold before flip exit (sec)", 0, 90, 30)
 
 st.sidebar.subheader("Assets")
 picked = st.sidebar.multiselect(
@@ -348,7 +348,7 @@ def analyse(asset):
     why = []
     min_secs = max(MIN_SECS_LEFT, FORCE_CLOSE_SECS + 15)
     if best < MIN_EDGE:
-        why.append(f"edge {best * 100:.1f}¢ is under the {MIN_EDGE * 100:.0f}¢ minimum")
+        why.append(f"edge {best * 100:.1f}% is under the {MIN_EDGE * 100:.0f}% minimum")
     if best > MAX_EDGE:
         why.append("edge looks too big to be real")
     if secs < min_secs:
@@ -562,7 +562,7 @@ def tradingview(symbol, height=380):
 
 # ====================== MAIN UI ======================
 st.title("Kalshi Full Auto Bot")
-st.caption(f"AUTO={AUTO_TRADE} | Min edge {MIN_EDGE * 100:.0f}¢ | SAFE ≤ {SAFE_MAX_PRICE * 100:.0f}¢ | "
+st.caption(f"AUTO={AUTO_TRADE} | Min edge {MIN_EDGE * 100:.0f}% | SAFE ≤ {SAFE_MAX_PRICE * 100:.0f}% | "
            f"SCALP={'on' if SCALP_ON else 'off'} | Kelly {KELLY:.2f}")
 
 try:
@@ -654,7 +654,7 @@ def main_loop():
                 prob_txt = f" | win chance {my_prob * 100:.0f}%" if my_prob is not None else ""
                 st.write(
                     f"**{ticker}** {mode} {side.upper()} | PnL `{pnl_pct * 100:+.1f}%` "
-                    f"({diff * 100:+.1f}¢){prob_txt} | {secs_left:.0f}s left")
+                    f"({diff * 100:+.1f}%){prob_txt} | {secs_left:.0f}s left")
 
                 status = None
                 if secs_left < FORCE_CLOSE_SECS:
@@ -708,7 +708,7 @@ def main_loop():
                       f"{d['secs']:.0f}s")
             st.progress(int(d["up"] * 100), text=f"P(UP) {d['up'] * 100:.1f}%")
             st.write(f"Model {d['up'] * 100:.0f}% → adj {d['adj'] * 100:.0f}% vs Kalshi {d['mid'] * 100:.0f}%")
-            st.write(f"Edge **{d['edge'] * 100:.1f}¢** → **{d['side'].upper()}** @ {d['cost'] * 100:.0f}¢")
+            st.write(f"Edge **{d['edge'] * 100:.1f}%** → **{d['side'].upper()}** @ {d['cost'] * 100:.0f}%")
 
             if 90 < d["secs"] < 240:
                 try:
