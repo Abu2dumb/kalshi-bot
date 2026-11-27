@@ -48,9 +48,20 @@ def place_order(ticker, side, count, price_dollars, action="buy", tif="immediate
     }
     headers = get_headers("POST", path)
     res = requests.post(f"{KALSHI}{path}", json=payload, headers=headers, timeout=10)
+    
+    # --- THE FIX: Check if the order actually filled ---
+    filled = 0
+    if res.status_code == 201:
+        try:
+            data = res.json()
+            filled = int(float(data.get("order", {}).get("fill_count", 0)))
+        except:
+            filled = 0
+            
     if res.status_code != 201:
         print(f"Order Error {res.status_code}: {res.text}")
-    return res.status_code, res.text
+        
+    return res.status_code, filled
 
 def get_kalshi(path, **params):
     try:
@@ -415,13 +426,13 @@ def analyse(asset):
             if not existing:
                 contracts = int(MAX_TRADE_USD // ask) if ask else 0
                 if contracts >= 1:
-                    status, resp = place_order(tk, side, contracts, ask, action="buy")
-                    if status == 201:
-                        st.toast(f"✅ {asset}: AUTO-BOUGHT SAFE {contracts}x {side.upper()}", icon="💰")
+                    status, filled = place_order(tk, side, contracts, ask, action="buy")
+                    if status == 201 and filled > 0:
+                        st.toast(f"✅ {asset}: AUTO-BOUGHT SAFE {filled}x {side.upper()}", icon="💰")
                         
                         # --- DB INSERT FIRST ---
                         db.execute("INSERT OR IGNORE INTO pos(key,ticker,asset,kind,side,count,entry,peak,close_time,status) VALUES(?,?,?,?,?,?,?,?,?,'open')",
-                                   (tk + mode, tk, asset, mode, side, contracts, ask, ask, close_str))
+                                   (tk + mode, tk, asset, mode, side, filled, ask, ask, close_str))
                         db.commit()
                         
                         if asset == "BTC":
@@ -432,7 +443,7 @@ def analyse(asset):
                             last_res = db.execute("SELECT ticker, result FROM preds WHERE result IS NOT NULL ORDER BY close_time DESC LIMIT 1").fetchone()
                             last_msg = f"\n**Last Market:** {last_res[0]} ended **{last_res[1].upper()}** · Bot was {'RIGHT ✅' if last_res[1] == side else 'WRONG ❌'}" if last_res else ""
                             desc = (
-                                f"Bought **{contracts}x {side.upper()}** @ **{ask*100:.0f}¢**\n\n"
+                                f"Bought **{filled}x {side.upper()}** @ **{ask*100:.0f}¢**\n\n"
                                 f"**Prediction:** `{direction}`\n"
                                 f"**Confidence:** `{conf:.0f}%` ({sure_text})\n"
                                 f"**Chart Pattern:** `{pat['name']}` ({pat['state']})\n"
@@ -440,6 +451,8 @@ def analyse(asset):
                                 f"**Technicals:** {votes_text}{last_msg}"
                             )
                             send_discord_message(f"🟢 BTC SAFE BUY", desc, 0x22c55e, tag_everyone=DISCORD_TAG)
+                    elif status == 201 and filled == 0:
+                        st.toast(f"⚠️ {asset}: Price moved, order cancelled.", icon="⚠️")
 
     # 2. SCALP SIGNAL
     elif ready and SCALP_ON and secs >= 120 and abs(z) >= 0.3:
@@ -452,13 +465,13 @@ def analyse(asset):
                 if not existing:
                     contracts = int(MAX_TRADE_USD // ask) if ask else 0
                     if contracts >= 1:
-                        status, resp = place_order(tk, side, contracts, ask, action="buy")
-                        if status == 201:
-                            st.toast(f"⚡ {asset}: AUTO-BOUGHT SCALP {contracts}x {side.upper()}", icon="⚡")
+                        status, filled = place_order(tk, side, contracts, ask, action="buy")
+                        if status == 201 and filled > 0:
+                            st.toast(f"⚡ {asset}: AUTO-BOUGHT SCALP {filled}x {side.upper()}", icon="⚡")
                             
                             # --- DB INSERT FIRST ---
                             db.execute("INSERT OR IGNORE INTO pos(key,ticker,asset,kind,side,count,entry,peak,close_time,status) VALUES(?,?,?,?,?,?,?,?,?,'open')",
-                                       (tk + mode, tk, asset, mode, side, contracts, ask, ask, close_str))
+                                       (tk + mode, tk, asset, mode, side, filled, ask, ask, close_str))
                             db.commit()
                             
                             if asset == "BTC":
@@ -469,7 +482,7 @@ def analyse(asset):
                                 last_res = db.execute("SELECT ticker, result FROM preds WHERE result IS NOT NULL ORDER BY close_time DESC LIMIT 1").fetchone()
                                 last_msg = f"\n**Last Market:** {last_res[0]} ended **{last_res[1].upper()}** · Bot was {'RIGHT ✅' if last_res[1] == side else 'WRONG ❌'}" if last_res else ""
                                 desc = (
-                                    f"Bought **{contracts}x {side.upper()}** @ **{ask*100:.0f}¢** (Scalp)\n\n"
+                                    f"Bought **{filled}x {side.upper()}** @ **{ask*100:.0f}¢** (Scalp)\n\n"
                                     f"**Prediction:** `{direction}`\n"
                                     f"**Confidence:** `{conf:.0f}%` ({sure_text})\n"
                                     f"**Chart Pattern:** `{pat['name']}` ({pat['state']})\n"
@@ -477,6 +490,8 @@ def analyse(asset):
                                     f"**Technicals:** {votes_text}{last_msg}"
                                 )
                                 send_discord_message(f"⚡ BTC SCALP BUY", desc, 0x8b5cf6, tag_everyone=DISCORD_TAG)
+                        elif status == 201 and filled == 0:
+                            st.toast(f"⚠️ {asset}: Price moved, order cancelled.", icon="⚠️")
 
     # --- MANAGE POSITIONS & CASH OUT ---
     poss = []
@@ -508,9 +523,9 @@ def analyse(asset):
                     sell_reason = "Confidence dropped while in profit"
 
         if should_sell:
-            status_sell, resp = place_order(tk, s, c_count or 1, b, action="sell")
-            if status_sell == 201:
-                st.toast(f"💰 {asset}: AUTO-SOLD {kind.upper()} {c_count}x {s.upper()} · {sell_reason}", icon="💰")
+            status_sell, filled = place_order(tk, s, c_count or 1, b, action="sell")
+            if status_sell == 201 and filled > 0:
+                st.toast(f"💰 {asset}: AUTO-SOLD {kind.upper()} {filled}x {s.upper()} · {sell_reason}", icon="💰")
                 
                 # --- DB UPDATE FIRST ---
                 db.execute("UPDATE pos SET status='closed', exit=?, pnl=?, win=1 WHERE key=?", (b, pnl, key))
@@ -524,7 +539,7 @@ def analyse(asset):
                     last_res = db.execute("SELECT ticker, result FROM preds WHERE result IS NOT NULL ORDER BY close_time DESC LIMIT 1").fetchone()
                     last_msg = f"\n**Last Market:** {last_res[0]} ended **{last_res[1].upper()}** · Bot was {'RIGHT ✅' if last_res[1] == side else 'WRONG ❌'}" if last_res else ""
                     desc = (
-                        f"Sold **{c_count}x {s.upper()}** @ **{b*100:.0f}¢**\n"
+                        f"Sold **{filled}x {s.upper()}** @ **{b*100:.0f}¢**\n"
                         f"**Reason:** {sell_reason}\n\n"
                         f"**Prediction:** `{direction}`\n"
                         f"**Confidence:** `{conf:.0f}%` ({sure_text})\n"
