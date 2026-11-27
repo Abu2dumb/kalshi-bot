@@ -34,7 +34,7 @@ def get_headers(method, path):
     }
 
 # ==========================================
-# ORDER PLACEMENT
+# ORDER PLACEMENT (V2 Strict)
 # ==========================================
 def place_order(ticker, side, count, price_dollars, action="buy", tif="immediate_or_cancel"):
     if action == "buy":
@@ -49,8 +49,8 @@ def place_order(ticker, side, count, price_dollars, action="buy", tif="immediate
         "ticker": ticker,
         "client_order_id": f"bot-{int(time.time()*1000)}",
         "side": api_side,
-        "count": f"{int(count)}.00",
-        "price": f"{yes_price:.4f}",
+        "count": int(count),
+        "price": round(yes_price, 4),
         "time_in_force": tif,
         "self_trade_prevention_type": "taker_at_cross"
     }
@@ -186,8 +186,8 @@ KRAKEN = {"BTC": "XBTUSD", "ETH": "ETHUSD", "SOL": "SOLUSD", "XRP": "XRPUSD", "D
 # ==========================================
 # SIDEBAR SETTINGS
 # ==========================================
-MIN_EDGE = st.sidebar.slider("Minimum edge after fees (%)", -10, 15, -5) / 100
-MIN_SECS = st.sidebar.slider("No new entries with less than (sec) left", 30, 300, 60)
+MIN_EDGE = st.sidebar.slider("Minimum edge after fees (%)", -10, 15, 2) / 100
+MIN_SECS = st.sidebar.slider("No new entries with less than (sec) left", 30, 300, 90)
 PRICE_CAP = st.sidebar.slider("Max contract price for SAFE buys (%)", 55, 95, 90) / 100
 SCALP_ON = st.sidebar.checkbox("Enable SCALP signals", True)
 SCALP_SL = st.sidebar.slider("Scalp stop loss (%)", 4, 12, 6) / 100
@@ -370,10 +370,7 @@ def card(d):
         f'<div class="tug"><div class="tu" style="width:{u}%">▲ UP {u}%</div><div class="td">DOWN {100-u}% ▼</div><div class="mid"></div></div>',
         f'<div class="bl"><span>Confidence</span><span>{cl} · {cf:.0f}%</span></div>',
         f'<div class="cm"><i style="left:calc({cf:.0f}% - 3px)"></i></div>',
-        
-        # --- NEW FLIP RISK ADDED HERE ---
         f'<div class="bl"><span>Flip Risk</span><span style="color:#f5c542;font-weight:700">{d["flip_pct"]}%</span></div>',
-        
         f'<div class="chips">{chips}</div>',
         f'<div class="bl"><span>1-min price vs target</span><span>last 15 min</span></div>',
         spark(d["closes"], color="#22c55e" if d["pct"] >= 0 else "#ef4444", mid=d["strike"]),
@@ -432,11 +429,9 @@ def analyse(asset):
 
     conf = max(0, min(100, abs(up - 0.5) * 100 + (sum(votes.values()) / 5) * 30))
     
-    # Flip Risk / Win Probability
     flip_pct = int(round(up * 100)) if ds > 0 else int(round((1 - up) * 100))
     if flip_pct < 50: flip_pct = 100 - flip_pct 
 
-    # --- SMART SLIDER BYPASS ---
     smart_bypass = (conf >= 75 and ready and secs >= MIN_SECS and agree and edge >= (MIN_EDGE - 0.05))
     
     why = []
@@ -484,7 +479,7 @@ def analyse(asset):
     elif ready and SCALP_ON and secs >= 120 and abs(z) >= 0.3:
         if (z > 0 and rsi_v < 40) or (z < 0 and rsi_v > 60):
             if ask > PRICE_CAP:
-                pass # Skip scalp if price is above cap
+                pass 
             else:
                 mode, price = "scalp", ask
                 scalp_target = ask + 0.06
@@ -515,7 +510,7 @@ def analyse(asset):
                             else:
                                 st.toast(f"⚠️ {asset}: SCALP order accepted but no fill", icon="⚠️")
 
-    # 3. WAIT FOR RETEST (Edge removed from Discord)
+    # 3. WAIT FOR RETEST
     elif ready and agree and edge < MIN_EDGE and not smart_bypass:
         mode, price = "retest", ask
         plan = f"Direction {'UP' if ds > 0 else 'DOWN'} · edge {edge*100:+.1f}% < {MIN_EDGE*100:+.1f}% · wait for better entry"
