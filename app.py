@@ -33,16 +33,28 @@ def get_headers(method, path):
         "Content-Type": "application/json"
     }
 
+# ==========================================
+# ORDER PLACEMENT (V2-correct payload)
+# ==========================================
 def place_order(ticker, side, count, price_dollars, action="buy", tif="immediate_or_cancel"):
-    api_side = "bid" if side == "yes" else "ask"
+    # V2 side mapping:
+    #   buy YES  -> bid   |  sell YES -> ask
+    #   buy NO   -> ask   |  sell NO  -> bid
+    if action == "buy":
+        api_side = "bid" if side == "yes" else "ask"
+    else:
+        api_side = "ask" if side == "yes" else "bid"
+
+    # V2 price is ALWAYS the YES price in dollars, regardless of side
+    yes_price = price_dollars if side == "yes" else 1.0 - price_dollars
+
     path = "/trade-api/v2/portfolio/events/orders"
     payload = {
         "ticker": ticker,
         "client_order_id": f"bot-{int(time.time()*1000)}",
         "side": api_side,
-        "action": action,
         "count": f"{int(count)}.00",
-        "price": f"{price_dollars:.4f}",
+        "price": f"{yes_price:.4f}",
         "time_in_force": tif,
         "self_trade_prevention_type": "taker_at_cross"
     }
@@ -387,7 +399,6 @@ def analyse(asset):
 
     votes, rsi_v = technicals(closed)
 
-    # Cosmetic chart pattern label
     _bull = sum(1 for v in votes.values() if v == 1)
     _bear = sum(1 for v in votes.values() if v == -1)
     if _bull >= 4:
