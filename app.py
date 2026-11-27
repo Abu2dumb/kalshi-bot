@@ -44,7 +44,7 @@ def place_order(ticker, side, count, price_dollars, action="buy", tif="immediate
         "count": f"{int(count)}.00",
         "price": f"{price_dollars:.4f}",
         "time_in_force": tif,
-        "self_trade_prevention_type": "taker_at_cross" 
+        "self_trade_prevention_type": "taker_at_cross"
     }
     headers = get_headers("POST", path)
     res = requests.post(f"{KALSHI}{path}", json=payload, headers=headers, timeout=10)
@@ -81,7 +81,7 @@ def send_discord_message(title, description, color=0x22c55e, tag_everyone=False)
         if tag_everyone:
             payload["content"] = "@everyone"
             payload["allowed_mentions"] = {"parse": ["everyone"]}
-            
+
         r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=5)
         if r.status_code == 429:
             retry_after = r.json().get("retry_after", 5)
@@ -191,6 +191,9 @@ DISCORD_TAG = st.sidebar.toggle("Tag @everyone in alerts", value=False)
 
 if st.sidebar.button("Reset history"):
     db.execute("DELETE FROM pos"); db.execute("DELETE FROM preds"); db.commit(); st.session_state.pop("toasted", None)
+    for k in list(st.session_state.keys()):
+        if k.startswith("hold_sent_") or k.startswith("retest_sent_"):
+            del st.session_state[k]
 
 # ==========================================
 # MATH & CORE LOGIC
@@ -362,14 +365,14 @@ def analyse(asset):
     if not m: return {"asset": asset, "err": "No open market right now"}
     if m.get("floor_strike") is None: return {"asset": asset, "err": "Market has no target price"}
     strike, tk, ct = float(m["floor_strike"]), m["ticker"], m["close_time"]
-    
+
     close_dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
     close_str = close_dt.isoformat()
 
     allc, vols, last_ts = candles(product)
     px = live_price(asset, product)
     spot = sum(px.values()) / len(px) if px else allc[-1]
-    
+
     closed = allc[:-1]
     pct = (spot / strike - 1) * 100
     now_ts = time.time()
@@ -381,10 +384,10 @@ def analyse(asset):
     mu_S, vf = settle_stat(spot, secs, tb, close_dt.timestamp())
     z = math.log(mu_S / strike) / math.sqrt(sig * sig * vf + 0.0003 ** 2)
     p_stat = cdf(z)
-    
+
     votes, rsi_v = technicals(closed)
 
-    # --- Discord display label (cosmetic only — does not affect trading) ---
+    # Cosmetic chart pattern label
     _bull = sum(1 for v in votes.values() if v == 1)
     _bear = sum(1 for v in votes.values() if v == -1)
     if _bull >= 4:
@@ -397,14 +400,14 @@ def analyse(asset):
         pat = {"name": "Mild Bear Bias", "state": "bearish"}
     else:
         pat = {"name": "Mixed / Chop", "state": "neutral"}
-    # --- end cosmetic label ---
+
     w = 0.15 + 0.35 * min(secs / 900, 1)
     model = (1 - w) * p_stat + w * (0.5 + 0.25 * sum(votes.values()) / len(votes))
-    
+
     ya, na, yb, nb = dollars(m, "yes_ask"), dollars(m, "no_ask"), dollars(m, "yes_bid"), dollars(m, "no_bid")
     k_yes = (yb + ya) / 2 if yb and ya else (ya or 0.5)
     up = 0.5 * model + 0.5 * k_yes
-    
+
     ds = 1 if up >= 0.5 else -1
     side = "yes" if ds > 0 else "no"
     ask, bid = (ya, yb) if ds > 0 else (na, nb)
@@ -412,16 +415,21 @@ def analyse(asset):
     ready = ask is not None and bid is not None
     edge = (ps - ask - fee(ask)) if ready else -1
     agree = (z > 0) == (ds > 0) and (k_yes >= 0.5) == (ds > 0)
-    
+
     conf = min(100, abs(up - 0.5) * 100 + (sum(votes.values()) / 5) * 30)
-    
+
     mode, plan, price = "wait", "Waiting for price, charts and Kalshi to line up.", None
-    
+    just_bought = set()
+
+    # Common vote text reused by all messages
+    votes_text = " | ".join([f"{k}: {'▲ UP' if v == 1 else '▼ DOWN' if v == -1 else '● NEUT'}" for k, v in votes.items()])
+    rsi_status = "Overbought" if rsi_v > 70 else "Oversold" if rsi_v < 30 else "Neutral"
+
     # 1. SAFE SIGNAL
     if ready and secs >= MIN_SECS and edge >= MIN_EDGE and agree:
         mode, price = "safe", ask
         plan = f"Max pay {(ps - MIN_EDGE - fee(ps))*100:.0f}% · target {min(0.93, ask + 0.15)*100:.0f}%"
-        
+
         if AUTO_TRADE_SAFE:
             existing = db.execute("SELECT 1 FROM pos WHERE key=? AND status='open'", (tk + mode,)).fetchone()
             if not existing:
@@ -429,23 +437,22 @@ def analyse(asset):
                 if contracts >= 1:
                     status, resp = place_order(tk, side, contracts, ask, action="buy")
                     if status == 201:
+                        just_bought.add(tk + mode)
                         st.toast(f"✅ {asset}: AUTO-BOUGHT SAFE {contracts}x {side.upper()}", icon="💰")
                         if asset == "BTC":
                             direction = "UP" if up >= 0.5 else "DOWN"
                             sure_text = "YES, I AM SURE" if conf >= 70 else "NOT SURE"
-                            votes_text = " | ".join([f"{k}: {'▲ UP' if v == 1 else '▼ DOWN' if v == -1 else '● NEUT'}" for k, v in votes.items()])
-                            rsi_status = "Overbought" if rsi_v > 70 else "Oversold" if rsi_v < 30 else "Neutral"
-                            last_res = db.execute("SELECT ticker, result FROM preds WHERE result IS NOT NULL ORDER BY close_time DESC LIMIT 1").fetchone()
-                            last_msg = f"\n**Last Market:** {last_res[0]} ended **{last_res[1].upper()}** · Bot was {'RIGHT ✅' if last_res[1] == side else 'WRONG ❌'}" if last_res else ""
+                            target_px = min(0.93, ask + 0.15)
                             desc = (
-                                f"Bought **{contracts}x {side.upper()}** @ **{ask*100:.0f}¢**\n\n"
+                                f"**BUY** {contracts}x **{side.upper()}** @ **{ask*100:.0f}¢** ({ask*100:.0f}%)\n"
+                                f"**Cash out target:** {target_px*100:.0f}¢ ({target_px*100:.0f}%)\n\n"
                                 f"**Prediction:** `{direction}`\n"
                                 f"**Confidence:** `{conf:.0f}%` ({sure_text})\n"
                                 f"**Chart Pattern:** `{pat['name']}` ({pat['state']})\n"
                                 f"**RSI:** `{rsi_v:.1f}` ({rsi_status})\n"
-                                f"**Technicals:** {votes_text}{last_msg}"
+                                f"**Technicals:** {votes_text}"
                             )
-                            send_discord_message(f"🟢 BTC SAFE BUY", desc, 0x22c55e, tag_everyone=DISCORD_TAG)
+                            send_discord_message("🟢 BTC SAFE BUY", desc, 0x22c55e, tag_everyone=DISCORD_TAG)
 
                         db.execute("INSERT OR IGNORE INTO pos(key,ticker,asset,kind,side,count,entry,peak,close_time,status) VALUES(?,?,?,?,?,?,?,?,?,'open')",
                                    (tk + mode, tk, asset, mode, side, contracts, ask, ask, close_str))
@@ -457,7 +464,9 @@ def analyse(asset):
     elif ready and SCALP_ON and secs >= 120 and abs(z) >= 0.3:
         if (z > 0 and rsi_v < 40) or (z < 0 and rsi_v > 60):
             mode, price = "scalp", ask
-            plan = f"Quick bounce trade · target {(ask + 0.06)*100:.0f}% · stop {(ask - SCALP_SL)*100:.0f}%"
+            scalp_target = ask + 0.06
+            scalp_stop = ask - SCALP_SL
+            plan = f"Quick bounce trade · target {scalp_target*100:.0f}% · stop {scalp_stop*100:.0f}%"
 
             if AUTO_TRADE_SCALP:
                 existing = db.execute("SELECT 1 FROM pos WHERE key=? AND status='open'", (tk + mode,)).fetchone()
@@ -466,29 +475,57 @@ def analyse(asset):
                     if contracts >= 1:
                         status, resp = place_order(tk, side, contracts, ask, action="buy")
                         if status == 201:
+                            just_bought.add(tk + mode)
                             st.toast(f"⚡ {asset}: AUTO-BOUGHT SCALP {contracts}x {side.upper()}", icon="⚡")
                             if asset == "BTC":
                                 direction = "UP" if up >= 0.5 else "DOWN"
                                 sure_text = "YES, I AM SURE" if conf >= 70 else "NOT SURE"
-                                votes_text = " | ".join([f"{k}: {'▲ UP' if v == 1 else '▼ DOWN' if v == -1 else '● NEUT'}" for k, v in votes.items()])
-                                rsi_status = "Overbought" if rsi_v > 70 else "Oversold" if rsi_v < 30 else "Neutral"
-                                last_res = db.execute("SELECT ticker, result FROM preds WHERE result IS NOT NULL ORDER BY close_time DESC LIMIT 1").fetchone()
-                                last_msg = f"\n**Last Market:** {last_res[0]} ended **{last_res[1].upper()}** · Bot was {'RIGHT ✅' if last_res[1] == side else 'WRONG ❌'}" if last_res else ""
                                 desc = (
-                                    f"Bought **{contracts}x {side.upper()}** @ **{ask*100:.0f}¢** (Scalp)\n\n"
+                                    f"⚡ **SCALP BUY INCOMING**\n\n"
+                                    f"**Buy at:** {ask*100:.0f}¢ ({ask*100:.0f}%)\n"
+                                    f"**Cash out at:** {scalp_target*100:.0f}¢ ({scalp_target*100:.0f}%) — +6¢ target\n"
+                                    f"**Stop loss:** {scalp_stop*100:.0f}¢ ({scalp_stop*100:.0f}%) — -{SCALP_SL*100:.0f}¢\n\n"
+                                    f"Bought **{contracts}x {side.upper()}** @ **{ask*100:.0f}¢**\n"
                                     f"**Prediction:** `{direction}`\n"
                                     f"**Confidence:** `{conf:.0f}%` ({sure_text})\n"
                                     f"**Chart Pattern:** `{pat['name']}` ({pat['state']})\n"
                                     f"**RSI:** `{rsi_v:.1f}` ({rsi_status})\n"
-                                    f"**Technicals:** {votes_text}{last_msg}"
+                                    f"**Technicals:** {votes_text}"
                                 )
-                                send_discord_message(f"⚡ BTC SCALP BUY", desc, 0x8b5cf6, tag_everyone=DISCORD_TAG)
+                                send_discord_message("⚡ BTC SCALP BUY INCOMING", desc, 0x8b5cf6, tag_everyone=DISCORD_TAG)
 
                             db.execute("INSERT OR IGNORE INTO pos(key,ticker,asset,kind,side,count,entry,peak,close_time,status) VALUES(?,?,?,?,?,?,?,?,?,'open')",
                                        (tk + mode, tk, asset, mode, side, contracts, ask, ask, close_str))
                             db.commit()
                         else:
                             st.toast(f"❌ {asset}: Scalp Order failed {status}", icon="🚨")
+
+    # 3. WAIT FOR RETEST — direction agrees but edge not good enough yet
+    elif ready and agree and edge < MIN_EDGE:
+        mode, price = "retest", ask
+        plan = f"Direction {'UP' if ds > 0 else 'DOWN'} · edge {edge*100:+.1f}% < {MIN_EDGE*100:+.1f}% · wait for better entry"
+
+        if asset == "BTC":
+            retest_key = f"retest_sent_{asset}"
+            if not st.session_state.get(retest_key):
+                direction = "UP" if ds > 0 else "DOWN"
+                desc = (
+                    f"**WAIT FOR RETEST** ⏳\n\n"
+                    f"**Direction:** `{direction}` (model & Kalshi agree)\n"
+                    f"**YES ask:** {ask*100:.0f}¢\n"
+                    f"**Current edge:** {edge*100:+.1f}% (need {MIN_EDGE*100:+.1f}%)\n\n"
+                    f"**Confidence:** `{conf:.0f}%`\n"
+                    f"**Chart Pattern:** `{pat['name']}` ({pat['state']})\n"
+                    f"**RSI:** `{rsi_v:.1f}` ({rsi_status})\n"
+                    f"**Technicals:** {votes_text}\n\n"
+                    f"_Will fire as **SAFE BUY** when edge improves._"
+                )
+                send_discord_message("⏳ BTC WAIT FOR RETEST", desc, 0xfbbf24, tag_everyone=DISCORD_TAG)
+                st.session_state[retest_key] = True
+
+    # Clear retest flag when mode leaves retest
+    if mode != "retest":
+        st.session_state[f"retest_sent_{asset}"] = False
 
     # --- MANAGE POSITIONS & CASH OUT ---
     poss = []
@@ -526,24 +563,25 @@ def analyse(asset):
                 if asset == "BTC":
                     direction = "UP" if up >= 0.5 else "DOWN"
                     sure_text = "YES, I AM SURE" if conf >= 70 else "NOT SURE"
-                    votes_text = " | ".join([f"{k}: {'▲ UP' if v == 1 else '▼ DOWN' if v == -1 else '● NEUT'}" for k, v in votes.items()])
-                    rsi_status = "Overbought" if rsi_v > 70 else "Oversold" if rsi_v < 30 else "Neutral"
-                    last_res = db.execute("SELECT ticker, result FROM preds WHERE result IS NOT NULL ORDER BY close_time DESC LIMIT 1").fetchone()
-                    last_msg = f"\n**Last Market:** {last_res[0]} ended **{last_res[1].upper()}** · Bot was {'RIGHT ✅' if last_res[1] == side else 'WRONG ❌'}" if last_res else ""
                     desc = (
-                        f"Sold **{c_count}x {s.upper()}** @ **{b*100:.0f}¢**\n"
+                        f"**SELL / CASH OUT AT PROFIT** 💰\n\n"
+                        f"**Bought at:** {entry*100:.0f}¢ ({entry*100:.0f}%)\n"
+                        f"**Cash out at:** {b*100:.0f}¢ ({b*100:.0f}%)\n"
+                        f"**Profit:** `+{pnl:.1f}%`\n"
                         f"**Reason:** {sell_reason}\n\n"
+                        f"Sold **{c_count}x {s.upper()}** @ **{b*100:.0f}¢**\n"
                         f"**Prediction:** `{direction}`\n"
                         f"**Confidence:** `{conf:.0f}%` ({sure_text})\n"
                         f"**Chart Pattern:** `{pat['name']}` ({pat['state']})\n"
                         f"**RSI:** `{rsi_v:.1f}` ({rsi_status})\n"
-                        f"**Technicals:** {votes_text}{last_msg}"
+                        f"**Technicals:** {votes_text}"
                     )
-                    send_discord_message(f"💰 BTC CASH OUT", desc, 0x10b981, tag_everyone=DISCORD_TAG)
+                    send_discord_message("💰 BTC CASH OUT AT PROFIT", desc, 0x10b981, tag_everyone=DISCORD_TAG)
 
                 db.execute("UPDATE pos SET status='closed', exit=?, pnl=?, win=1 WHERE key=?", (b, pnl, key))
                 db.commit()
                 poss.append(dict(kind=kind, side=s, entry=entry, status="closed", exit=b, pnl=pnl))
+                st.session_state.pop(f"hold_sent_{key}", None)
                 continue
             else:
                 st.toast(f"❌ {asset}: Auto-sell failed {status_sell}", icon="🚨")
@@ -558,6 +596,25 @@ def analyse(asset):
             elif pnl > 0 and p_side < SELL_CONFIDENCE: a = ("💰 SELL NOW", "go", "Confidence dropped below sell threshold.")
             else: a = ("✋ HOLD", "", f"Holding (~{p_side*100:.0f}%) beats selling.")
 
+        # HOLD Discord notification — once per position, skip if just bought this cycle
+        if asset == "BTC" and key not in just_bought and a[0] == "✋ HOLD":
+            hold_key = f"hold_sent_{key}"
+            if not st.session_state.get(hold_key):
+                direction = "UP" if p_side >= 0.5 else "DOWN"
+                desc = (
+                    f"**HOLD** ✋\n\n"
+                    f"Holding **{c_count or 1}x {s.upper()}** @ **{entry*100:.0f}¢** ({entry*100:.0f}%)\n"
+                    f"**Current bid:** {b*100:.0f}¢ ({b*100:.0f}%)\n"
+                    f"**Unrealized:** `{pnl:+.1f}%`\n\n"
+                    f"**Why hold:** {a[2]}\n"
+                    f"**Prediction:** `{direction}`\n"
+                    f"**Confidence:** `{conf:.0f}%`\n"
+                    f"**Chart Pattern:** `{pat['name']}` ({pat['state']})\n"
+                    f"**RSI:** `{rsi_v:.1f}` ({rsi_status})"
+                )
+                send_discord_message("✋ BTC HOLD", desc, 0x9fb0d0, tag_everyone=DISCORD_TAG)
+                st.session_state[hold_key] = True
+
         poss.append(dict(kind=kind, side=s, entry=entry, status="open", bid=b, act=a[0], cls=a[1], why=a[2], pnl=pnl))
 
     return dict(asset=asset, ticker=tk, spot=spot, strike=strike, pct=pct, chg5=(spot / allc[-6] - 1) * 100,
@@ -565,9 +622,9 @@ def analyse(asset):
                 conf=conf, votes=votes, rsi=rsi_v, poss=poss, srcs="+".join(px) or "Coinbase", closes=allc[-15:])
 
 # ==========================================
-# LIVE DASHBOARD
+# LIVE DASHBOARD — refreshes every 15s
 # ==========================================
-@st.fragment(run_every=5)
+@st.fragment(run_every=15)
 def live():
     grade()
 
@@ -591,7 +648,7 @@ def live():
                 <div class="title">⚡ Kalshi 15-Min Crypto Desk</div>
                 <div class="sub">Settlement-aware model · multi-exchange price · self-check · auto-trading enabled</div>
             </div>
-            <div class="live">● LIVE · {now.strftime("%H:%M:%S")} UTC<br><span class="sub">next 1-min candle in {60-now.second}s</span></div>
+            <div class="live">● LIVE · {now.strftime("%H:%M:%S")} UTC<br><span class="sub">refresh every 15s</span></div>
         </div>
         <div class="stats">
             <div class="stat"><div class="l">Win rate</div><div class="v">{wr}</div></div>
