@@ -1,5 +1,5 @@
-app = "kalshi-bot" # You can change this name
-primary_region = "iad" # Change to your closest region (e.g., "lax", "ord", "lhr")
+app = "kalshi-bot" 
+primary_region = "iad" 
 
 [build]
 
