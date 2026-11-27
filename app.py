@@ -71,6 +71,8 @@ st.sidebar.subheader("Sizing")
 BANKROLL = st.sidebar.number_input("Bankroll for stake suggestions ($)", 5.0, 10000.0, 20.0, step=5.0)
 KELLY = st.sidebar.slider("Kelly fraction (smaller = safer)", 0.05, 0.50, 0.25, step=0.05)
 MAX_STAKE_PCT = st.sidebar.slider("Max stake per trade (% of bankroll)", 1, 10, 4) / 100
+BET_MIN, BET_MAX = st.sidebar.slider("Price per bet range: min / max ($)", 0.5, 30.0, (1.0, 2.0), step=0.5)
+FIXED_BET = st.sidebar.toggle("Always bet the max amount (skip Kelly)", value=False)
 MAX_CONTRACTS = st.sidebar.slider("Max contracts per trade", 1, 8, 3)
 
 st.sidebar.subheader("Safety")
@@ -392,9 +394,18 @@ def size_for(d, balance):
     p = d["adj"] if d["side"] == "yes" else 1 - d["adj"]
     f = (p - c - fee(c)) / (1 - c) if c < 1 else 0
     f = max(f, 0)
-    stake = min(KELLY * f * BANKROLL, MAX_STAKE_PCT * BANKROLL, max(balance, 0) * 0.9)
+    cash_cap = max(balance, 0) * 0.9
+    if FIXED_BET:
+        wanted = BET_MAX
+    else:
+        wanted = min(KELLY * f * BANKROLL, MAX_STAKE_PCT * BANKROLL)
+    # Keep every bet between your min and max (the min overrides Kelly / stake %)
+    stake = min(max(wanted, BET_MIN), BET_MAX, cash_cap)
     n = int(stake // c) if c > 0 else 0
-    return max(0, min(MAX_CONTRACTS, n)), stake
+    if n == 0 and 0 < c <= min(BET_MAX, cash_cap):
+        n = 1   # one contract still fits inside your max bet
+    n = max(0, min(MAX_CONTRACTS, n))
+    return n, n * c
 
 
 @st.cache_data(ttl=15, show_spinner=False)
