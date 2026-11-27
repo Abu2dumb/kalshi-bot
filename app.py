@@ -421,7 +421,6 @@ def analyse(asset):
     mode, plan, price = "wait", "Waiting for price, charts and Kalshi to line up.", None
     just_bought = set()
 
-    # Common vote text reused by all messages
     votes_text = " | ".join([f"{k}: {'▲ UP' if v == 1 else '▼ DOWN' if v == -1 else '● NEUT'}" for k, v in votes.items()])
     rsi_status = "Overbought" if rsi_v > 70 else "Oversold" if rsi_v < 30 else "Neutral"
 
@@ -523,7 +522,6 @@ def analyse(asset):
                 send_discord_message("⏳ BTC WAIT FOR RETEST", desc, 0xfbbf24, tag_everyone=DISCORD_TAG)
                 st.session_state[retest_key] = True
 
-    # Clear retest flag when mode leaves retest
     if mode != "retest":
         st.session_state[f"retest_sent_{asset}"] = False
 
@@ -596,7 +594,6 @@ def analyse(asset):
             elif pnl > 0 and p_side < SELL_CONFIDENCE: a = ("💰 SELL NOW", "go", "Confidence dropped below sell threshold.")
             else: a = ("✋ HOLD", "", f"Holding (~{p_side*100:.0f}%) beats selling.")
 
-        # HOLD Discord notification — once per position, skip if just bought this cycle
         if asset == "BTC" and key not in just_bought and a[0] == "✋ HOLD":
             hold_key = f"hold_sent_{key}"
             if not st.session_state.get(hold_key):
