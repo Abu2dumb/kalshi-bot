@@ -359,6 +359,7 @@ def card(d):
     c1, c2 = ("up" if d["pct"] >= 0 else "dn"), ("up" if d["chg5"] >= 0 else "dn")
     chips = ("".join(chip(k, v) for k, v in d["votes"].items()) + f'<span class="chip" style="color:#9fb0d0">RSI {d["rsi"]:.0f}</span>')
     ph = "".join(pos_html(p) for p in d["poss"]) or '<div class="cash">No open position · <b>nothing to cash out</b></div>'
+    
     return "".join([
         f'<div class="card"><div class="hdr"><span><span class="sym">{a}</span><span class="nm">{ASSETS[a][3]}</span></span>',
         f'<span class="pill">⏱ {s//60}:{s%60:02d}</span></div>',
@@ -369,6 +370,10 @@ def card(d):
         f'<div class="tug"><div class="tu" style="width:{u}%">▲ UP {u}%</div><div class="td">DOWN {100-u}% ▼</div><div class="mid"></div></div>',
         f'<div class="bl"><span>Confidence</span><span>{cl} · {cf:.0f}%</span></div>',
         f'<div class="cm"><i style="left:calc({cf:.0f}% - 3px)"></i></div>',
+        
+        # --- NEW FLIP RISK ADDED HERE ---
+        f'<div class="bl"><span>Flip Risk</span><span style="color:#f5c542;font-weight:700">{d["flip_pct"]}%</span></div>',
+        
         f'<div class="chips">{chips}</div>',
         f'<div class="bl"><span>1-min price vs target</span><span>last 15 min</span></div>',
         spark(d["closes"], color="#22c55e" if d["pct"] >= 0 else "#ef4444", mid=d["strike"]),
@@ -427,12 +432,11 @@ def analyse(asset):
 
     conf = max(0, min(100, abs(up - 0.5) * 100 + (sum(votes.values()) / 5) * 30))
     
-    # Calculate Flip % (probability of winning the trade)
+    # Flip Risk / Win Probability
     flip_pct = int(round(up * 100)) if ds > 0 else int(round((1 - up) * 100))
     if flip_pct < 50: flip_pct = 100 - flip_pct 
 
     # --- SMART SLIDER BYPASS ---
-    # If confidence is >75%, bypass the Edge slider (but NEVER bypass the Price Cap).
     smart_bypass = (conf >= 75 and ready and secs >= MIN_SECS and agree and edge >= (MIN_EDGE - 0.05))
     
     why = []
@@ -466,7 +470,7 @@ def analyse(asset):
                             just_bought.add(tk + mode)
                             st.toast(f"✅ {asset}: AUTO-BOUGHT SAFE {n_filled}x {side.upper()}", icon="💰")
                             if asset == "BTC":
-                                desc = f"**Flip %:** {flip_pct}%\n**Buy at:** {ask*100:.0f}%"
+                                desc = f"**Flip Risk:** {flip_pct}%\n**Buy at:** {ask*100:.0f}%"
                                 if smart_bypass: desc += "\n*(High Conviction)*"
                                 send_discord_message("🟢 BTC SAFE BUY", desc, 0x22c55e, tag_everyone=DISCORD_TAG)
 
@@ -499,7 +503,7 @@ def analyse(asset):
                                 just_bought.add(tk + mode)
                                 st.toast(f"⚡ {asset}: AUTO-BOUGHT SCALP {n_filled}x {side.upper()}", icon="⚡")
                                 if asset == "BTC":
-                                    desc = (f"**Flip %:** {flip_pct}%\n"
+                                    desc = (f"**Flip Risk:** {flip_pct}%\n"
                                             f"**Buy:** {ask*100:.0f}%\n"
                                             f"**Cash Out:** {scalp_target*100:.0f}%\n"
                                             f"**Stop:** {scalp_stop*100:.0f}%")
@@ -511,7 +515,7 @@ def analyse(asset):
                             else:
                                 st.toast(f"⚠️ {asset}: SCALP order accepted but no fill", icon="⚠️")
 
-    # 3. WAIT FOR RETEST
+    # 3. WAIT FOR RETEST (Edge removed from Discord)
     elif ready and agree and edge < MIN_EDGE and not smart_bypass:
         mode, price = "retest", ask
         plan = f"Direction {'UP' if ds > 0 else 'DOWN'} · edge {edge*100:+.1f}% < {MIN_EDGE*100:+.1f}% · wait for better entry"
@@ -520,8 +524,7 @@ def analyse(asset):
             retest_key = f"retest_sent_{asset}"
             if not st.session_state.get(retest_key):
                 desc = (f"**WAIT / NO TRADE** ⏳\n\n"
-                        f"**Flip %:** {flip_pct}%\n"
-                        f"**Edge:** {edge*100:+.1f}% (Needs {MIN_EDGE*100:+.1f}%)\n"
+                        f"**Flip Risk:** {flip_pct}%\n"
                         f"*Waiting for a better price...*")
                 send_discord_message("⏳ BTC WAIT FOR RETEST", desc, 0xfbbf24, tag_everyone=DISCORD_TAG)
                 st.session_state[retest_key] = True
@@ -567,7 +570,7 @@ def analyse(asset):
                 st.toast(f"💰 {asset}: AUTO-SOLD {n_sold}x {s.upper()} · {sell_reason}", icon="💰")
                 if asset == "BTC":
                     desc = (f"**CASH OUT** 💰\n\n"
-                            f"**Flip %:** {flip_pct}%\n"
+                            f"**Flip Risk:** {flip_pct}%\n"
                             f"**Sold at:** {b*100:.0f}%\n"
                             f"**Profit:** {pnl:+.1f}%")
                     send_discord_message("💰 BTC CASH OUT", desc, 0x10b981, tag_everyone=DISCORD_TAG)
@@ -598,7 +601,7 @@ def analyse(asset):
             hold_key = f"hold_sent_{key}"
             if not st.session_state.get(hold_key):
                 desc = (f"**HOLD** ✋\n\n"
-                        f"**Flip %:** {flip_pct}%\n"
+                        f"**Flip Risk:** {flip_pct}%\n"
                         f"**Current Value:** {b*100:.0f}%")
                 send_discord_message("✋ BTC HOLD", desc, 0x9fb0d0, tag_everyone=DISCORD_TAG)
                 st.session_state[hold_key] = True
@@ -607,7 +610,7 @@ def analyse(asset):
 
     return dict(asset=asset, ticker=tk, spot=spot, strike=strike, pct=pct, chg5=(spot / allc[-6] - 1) * 100,
                 secs=secs, k_yes=k_yes, up=up, edge=edge * 100, mode=mode, side=side, price=price, plan=plan,
-                conf=conf, votes=votes, rsi=rsi_v, poss=poss, srcs="+".join(px) or "Coinbase", closes=allc[-15:])
+                conf=conf, votes=votes, rsi=rsi_v, poss=poss, srcs="+".join(px) or "Coinbase", closes=allc[-15:], flip_pct=flip_pct)
 
 # ==========================================
 # LIVE DASHBOARD — refreshes every 15s
