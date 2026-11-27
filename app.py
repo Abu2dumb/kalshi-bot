@@ -250,6 +250,7 @@ def live_price(product):
         return None
 
 
+@st.cache_data(ttl=4, show_spinner=False)
 def market(series):
     path = "/markets"
     r = requests.get(
@@ -396,6 +397,7 @@ def size_for(d, balance):
     return max(0, min(MAX_CONTRACTS, n)), stake
 
 
+@st.cache_data(ttl=15, show_spinner=False)
 def get_balance():
     path = "/portfolio/balance"
     r = requests.get(BASE + path,
@@ -404,6 +406,7 @@ def get_balance():
     return r.json()
 
 
+@st.cache_data(ttl=4, show_spinner=False)
 def get_positions():
     path = "/portfolio/positions"
     r = requests.get(BASE + path,
@@ -485,7 +488,7 @@ def resolve_signals():
     if time.time() - st.session_state.get("last_resolve", 0) < 60:
         return
     st.session_state["last_resolve"] = time.time()
-    rows = db.execute("SELECT ticker FROM signals WHERE result IS NULL ORDER BY id LIMIT 15").fetchall()
+    rows = db.execute("SELECT ticker FROM signals WHERE result IS NULL ORDER BY id LIMIT 5").fetchall()
     for (tk,) in rows:
         try:
             path = f"/markets/{tk}"
@@ -554,10 +557,12 @@ st.caption(f"AUTO={AUTO_TRADE} | Min edge {MIN_EDGE * 100:.0f}¢ | SAFE ≤ {SAF
 try:
     bal = get_balance()
     balance = bal.get("balance", 0) / 100
+    st.session_state["last_balance"] = balance
     st.metric("Available Balance", f"${balance:.2f}")
 except Exception as e:
-    st.error(f"Balance error: {e}")
-    balance = 0
+    balance = st.session_state.get("last_balance", 0)
+    st.metric("Available Balance", f"${balance:.2f}")
+    st.caption(f"Balance temporarily unavailable ({e}). Showing last known value.")
 
 if PAUSE_ON_LOSSES and losing_streak():
     st.warning("Paused: the last 3 closed trades were losses. No new entries until you resume.")
@@ -567,12 +572,13 @@ if PAUSE_ON_LOSSES and losing_streak():
         st.rerun()
 
 
-@st.fragment(run_every=7)
+@st.fragment(run_every=10)
 def main_loop():
     try:
         bal_now = get_balance().get("balance", 0) / 100
+        st.session_state["last_balance"] = bal_now
     except Exception:
-        bal_now = balance
+        bal_now = st.session_state.get("last_balance", balance)
 
     # ---------------- Positions: lock markets + auto cashout ----------------
     try:
