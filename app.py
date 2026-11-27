@@ -44,7 +44,7 @@ def place_order(ticker, side, count, price_dollars, action="buy", tif="immediate
         "count": f"{int(count)}.00",
         "price": f"{price_dollars:.4f}",
         "time_in_force": tif,
-        "self_trade_prevention_type": "taker_at_cross" 
+        "self_trade_prevention_type": "taker_at_cross"
     }
     headers = get_headers("POST", path)
     res = requests.post(f"{KALSHI}{path}", json=payload, headers=headers, timeout=10)
@@ -54,19 +54,24 @@ def place_order(ticker, side, count, price_dollars, action="buy", tif="immediate
 
 def get_kalshi(path, **params):
     try:
-        r = requests.get(f"{KALSHI}{path}", params=params, headers=get_headers("GET", path), timeout=10)
+        r = requests.get(f"{KALSHI}{path}", params=params,
+                         headers=get_headers("GET", path), timeout=10)
         r.raise_for_status()
         return r.json()
     except Exception:
         return {}
 
 # ==========================================
-# DISCORD NOTIFICATION FUNCTION
+# DISCORD NOTIFICATION FUNCTION (Rate Limit Safe)
 # ==========================================
-def send_discord_message(title, description, color=0x22c55e, tag_everyone=False):
-    if not DISCORD_WEBHOOK_URL: return
+def send_discord_message(title, description, color=0x22c55e, tag_everyone=True):
+    if not DISCORD_WEBHOOK_URL:
+        return
+
     cooldown = st.session_state.get("discord_cooldown", 0)
-    if time.time() < cooldown: return
+    if time.time() < cooldown:
+        print("Discord cooldown active. Skipping message.")
+        return
 
     try:
         payload = {
@@ -81,13 +86,18 @@ def send_discord_message(title, description, color=0x22c55e, tag_everyone=False)
         if tag_everyone:
             payload["content"] = "@everyone"
             payload["allowed_mentions"] = {"parse": ["everyone"]}
-            
+
         r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=5)
+
         if r.status_code == 429:
             retry_after = r.json().get("retry_after", 5)
             st.session_state["discord_cooldown"] = time.time() + retry_after
-    except Exception:
-        pass
+            print(f"Rate limited! Cooling down for {retry_after} seconds.")
+        elif r.status_code >= 400:
+            print(f"Discord Error: {r.status_code} {r.text}")
+
+    except Exception as e:
+        print(f"Discord webhook failed: {e}")
 
 # ==========================================
 # UI STYLING
@@ -101,6 +111,7 @@ st.markdown("""<style>
 .top {display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
 .title {font-size:1.7rem;font-weight:800;color:#e8eefc}
 .sub {color:#7d8aa5;font-size:.85rem}.live {color:#22c55e;font-weight:700;font-size:.8rem;text-align:right}
+.alert {background:linear-gradient(90deg,#14532d,#166534);border:1px solid #22c55e;color:#bbf7d0;border-radius:12px;padding:12px 16px;font-weight:800;margin-bottom:14px}
 .stats {display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:18px}
 .stat {background:#101728;border:1px solid #1f2a40;border-radius:14px;padding:14px 18px}
 .stat .l {color:#7d8aa5;font-size:.72rem;text-transform:uppercase;letter-spacing:.08em}
@@ -140,7 +151,7 @@ st.markdown("""<style>
 </style>""", unsafe_allow_html=True)
 
 DB_FILE = "calls3.db"
-db = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=30)
+db = sqlite3.connect(DB_FILE, check_same_thread=False)
 db.execute("""CREATE TABLE IF NOT EXISTS pos(key TEXT PRIMARY KEY, ticker TEXT, asset TEXT, kind TEXT, side TEXT,
 count INTEGER, entry REAL, peak REAL, close_time TEXT, status TEXT, exit REAL, pnl REAL, win INTEGER)""")
 try:
@@ -163,7 +174,7 @@ KRAKEN = {"BTC": "XBTUSD", "ETH": "ETHUSD", "SOL": "SOLUSD", "XRP": "XRPUSD", "D
 # ==========================================
 # SIDEBAR SETTINGS
 # ==========================================
-MIN_EDGE = st.sidebar.slider("Minimum edge after fees (%)", -10, 15, -5) / 100
+MIN_EDGE = st.sidebar.slider("Minimum edge after fees (%)", -10, 15, -2) / 100
 MIN_SECS = st.sidebar.slider("No new entries with less than (sec) left", 30, 300, 60)
 PRICE_CAP = st.sidebar.slider("Max contract price for SAFE buys (%)", 55, 95, 90) / 100
 SCALP_ON = st.sidebar.checkbox("Enable SCALP signals", True)
@@ -187,10 +198,65 @@ SELL_CONFIDENCE = st.sidebar.slider("Sell standard if confidence drops below (%)
 
 st.sidebar.markdown("---")
 st.sidebar.header("💬 Discord Alerts")
+DISCORD_INTERVAL = st.sidebar.slider("Send BTC update every X seconds", 10, 60, 10)
 DISCORD_TAG = st.sidebar.toggle("Tag @everyone in alerts", value=False)
 
 if st.sidebar.button("Reset history"):
     db.execute("DELETE FROM pos"); db.execute("DELETE FROM preds"); db.commit(); st.session_state.pop("toasted", None)
+
+# ==========================================
+# CHART PATTERNS
+# ==========================================
+def _pivots(c, k=3):
+    hi, lo = [], []
+    for i in range(k, len(c) - k):
+        w = c[i-k:i+k+1]
+        if c[i] == max(w) and c[i] != c[i-1]: hi.append((i, c[i]))
+        if c[i] == min(w) and c[i] != c[i-1]: lo.append((i, c[i]))
+    return hi, lo
+
+def _slope(p):
+    n = len(p); mx = sum(x for x, _ in p) / n; my = sum(y for _, y in p) / n
+    d = sum((x - mx) ** 2 for x, _ in p) or 1
+    return sum((x - mx) * (y - my) for x, y in p) / d
+
+def _p(name, bias, conf, target=None, inv=None):
+    return dict(name=name, bias=bias, state="CONFIRMED" if conf else "FORMING",
+                adj=bias * (0.06 if conf else 0.025), target=target, inv=inv)
+
+NONE_PAT = dict(name="None", bias=0, state="", adj=0.0, target=None, inv=None)
+
+def _find(c):
+    w = c[-45:]; n = len(w); last = w[-1]
+    rng = max(w) - min(w)
+    if n < 30 or rng <= 0 or rng / last < 0.0008: return NONE_PAT
+    hi, lo = _pivots(w)
+    near = lambda i: n - 1 - i <= 15
+    if len(hi) >= 3 and near(hi[-1][0]):
+        (a, av), (b, bv), (d, dv) = hi[-3:]
+        if bv > av and bv > dv and abs(av - dv) <= 0.2 * rng:
+            neck = (min(w[a:b+1]) + min(w[b:d+1])) / 2
+            return _p("Head & Shoulders", -1, last < neck, neck - (bv - neck), dv)
+    if len(lo) >= 3 and near(lo[-1][0]):
+        (a, av), (b, bv), (d, dv) = lo[-3:]
+        if bv < av and bv < dv and abs(av - dv) <= 0.2 * rng:
+            neck = (max(w[a:b+1]) + max(w[b:d+1])) / 2
+            return _p("Inverse Head & Shoulders", 1, last > neck, neck + (neck - bv), dv)
+    if len(hi) >= 2 and near(hi[-1][0]):
+        (a, av), (d, dv) = hi[-2:]
+        tr = min(w[a:d+1])
+        if d - a >= 5 and abs(av - dv) <= 0.12 * rng and min(av, dv) - tr >= 0.25 * rng:
+            return _p("Double Top (M)", -1, last < tr, tr - (min(av, dv) - tr), max(av, dv))
+    if len(lo) >= 2 and near(lo[-1][0]):
+        (a, av), (d, dv) = lo[-2:]
+        pk = max(w[a:d+1])
+        if d - a >= 5 and abs(av - dv) <= 0.12 * rng and pk - max(av, dv) >= 0.25 * rng:
+            return _p("Double Bottom (W)", 1, last > pk, pk + (pk - max(av, dv)), min(av, dv))
+    return NONE_PAT
+
+def find_pattern(c):
+    try: return _find(c)
+    except Exception: return NONE_PAT
 
 # ==========================================
 # MATH & CORE LOGIC
@@ -285,7 +351,8 @@ def grade():
                         db.execute("UPDATE pos SET status='settled', exit=?, pnl=?, win=? WHERE key=?",
                                    (ex, (ex - entry) / entry * 100, int(won), key))
                 db.commit()
-        except Exception: pass
+        except Exception as e:
+            print(f"Grade error for {t}: {e}")
 
 # ==========================================
 # UI COMPONENTS
@@ -362,14 +429,14 @@ def analyse(asset):
     if not m: return {"asset": asset, "err": "No open market right now"}
     if m.get("floor_strike") is None: return {"asset": asset, "err": "Market has no target price"}
     strike, tk, ct = float(m["floor_strike"]), m["ticker"], m["close_time"]
-    
+
     close_dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
     close_str = close_dt.isoformat()
 
     allc, vols, last_ts = candles(product)
     px = live_price(asset, product)
     spot = sum(px.values()) / len(px) if px else allc[-1]
-    
+
     closed = allc[:-1]
     pct = (spot / strike - 1) * 100
     now_ts = time.time()
@@ -381,15 +448,16 @@ def analyse(asset):
     mu_S, vf = settle_stat(spot, secs, tb, close_dt.timestamp())
     z = math.log(mu_S / strike) / math.sqrt(sig * sig * vf + 0.0003 ** 2)
     p_stat = cdf(z)
-    
+
     votes, rsi_v = technicals(closed)
     w = 0.15 + 0.35 * min(secs / 900, 1)
     model = (1 - w) * p_stat + w * (0.5 + 0.25 * sum(votes.values()) / len(votes))
-    
+    pat = find_pattern(closed)
+
     ya, na, yb, nb = dollars(m, "yes_ask"), dollars(m, "no_ask"), dollars(m, "yes_bid"), dollars(m, "no_bid")
     k_yes = (yb + ya) / 2 if yb and ya else (ya or 0.5)
     up = 0.5 * model + 0.5 * k_yes
-    
+
     ds = 1 if up >= 0.5 else -1
     side = "yes" if ds > 0 else "no"
     ask, bid = (ya, yb) if ds > 0 else (na, nb)
@@ -397,16 +465,17 @@ def analyse(asset):
     ready = ask is not None and bid is not None
     edge = (ps - ask - fee(ask)) if ready else -1
     agree = (z > 0) == (ds > 0) and (k_yes >= 0.5) == (ds > 0)
-    
+
     conf = min(100, abs(up - 0.5) * 100 + (sum(votes.values()) / 5) * 30)
-    
+
+    # --- SIGNAL GENERATION ---
     mode, plan, price = "wait", "Waiting for price, charts and Kalshi to line up.", None
-    
+
     # 1. SAFE SIGNAL
     if ready and secs >= MIN_SECS and edge >= MIN_EDGE and agree:
         mode, price = "safe", ask
         plan = f"Max pay {(ps - MIN_EDGE - fee(ps))*100:.0f}% · target {min(0.93, ask + 0.15)*100:.0f}%"
-        
+
         if AUTO_TRADE_SAFE:
             existing = db.execute("SELECT 1 FROM pos WHERE key=? AND status='open'", (tk + mode,)).fetchone()
             if not existing:
@@ -420,6 +489,7 @@ def analyse(asset):
                             sure_text = "YES, I AM SURE" if conf >= 70 else "NOT SURE"
                             votes_text = " | ".join([f"{k}: {'▲ UP' if v == 1 else '▼ DOWN' if v == -1 else '● NEUT'}" for k, v in votes.items()])
                             rsi_status = "Overbought" if rsi_v > 70 else "Oversold" if rsi_v < 30 else "Neutral"
+                            # --- Get Last Market Result ---
                             last_res = db.execute("SELECT ticker, result FROM preds WHERE result IS NOT NULL ORDER BY close_time DESC LIMIT 1").fetchone()
                             last_msg = f"\n**Last Market:** {last_res[0]} ended **{last_res[1].upper()}** · Bot was {'RIGHT ✅' if last_res[1] == side else 'WRONG ❌'}" if last_res else ""
                             desc = (
