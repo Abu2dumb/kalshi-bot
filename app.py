@@ -1,7 +1,7 @@
 import math, time, os, base64, uuid, sqlite3
 import requests, streamlit as st
 import streamlit.components.v1 as components
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from cryptography.hazmat.primitives import serialization
 
 try:
@@ -506,31 +506,70 @@ def resolve_signals():
             r = requests.get(BASE + path,
                              headers=kalshi_headers("GET", f"/trade-api/v2{path}"), timeout=8)
             r.raise_for_status()
-            res = (r.json().get("market", {}) or {}).get("result")
+            mk = r.json().get("market", {}) or {}
+            res = mk.get("result")
+            st.session_state["resolve_note"] = f"{tk}: status={mk.get('status')}, result={res!r}"
             if res in ("yes", "no"):
                 db.execute("UPDATE signals SET result=? WHERE ticker=?", (res, tk))
-        except Exception:
-            pass
+        except Exception as e:
+            st.session_state["resolve_note"] = f"{tk}: {e}"
     db.commit()
 
 
+def proof_counts():
+    total = db.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
+    settled = db.execute("SELECT COUNT(*) FROM signals WHERE result IS NOT NULL").fetchone()[0]
+    return total, settled, total - settled
+
+
+@st.fragment(run_every=30)
 def calibration_panel():
     st.subheader("Is the model actually accurate?")
     resolve_signals()
+    total, settled, pending = proof_counts()
+    proven, _ = bot_proven()
+
+    st.progress(min(settled / PROVEN_MIN_SAMPLES, 1.0),
+                text=f"{settled} / {PROVEN_MIN_SAMPLES} markets settled")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Logged", total)
+    c2.metric(f"Settled (counts toward {PROVEN_MIN_SAMPLES})", settled)
+    c3.metric("Waiting to settle", pending)
+    st.caption("A market is logged when it has 90-240 seconds left, and only while this page is open. "
+               "It counts toward the total after Kalshi settles it. "
+               f"Status: {'PROVEN' if proven else 'not proven yet'}")
+
+    last = db.execute("SELECT ticker, logged_at FROM signals ORDER BY id DESC LIMIT 1").fetchone()
+    if last:
+        st.caption(f"Last market logged: {last[0]} at {last[1][:19]} UTC")
+    else:
+        st.caption("Nothing logged yet. Keep this page open and a market will be logged within 15 minutes.")
+
+    data_dir = os.path.dirname(DB_PATH)
+    if not os.path.ismount(data_dir):
+        st.warning(f"{data_dir} is not a mounted Fly volume, so this log can be wiped on every deploy or "
+                   "restart and the count would start over. Check the [mounts] section of fly.toml.")
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=25)).isoformat()
+    stale = db.execute(
+        "SELECT COUNT(*) FROM signals WHERE result IS NULL AND logged_at < ?", (cutoff,)).fetchone()[0]
+    if stale:
+        st.warning(f"{stale} logged market(s) should have settled by now, but Kalshi hasn't returned a "
+                   "result for them. The settlement lookup may not be working.")
+    note = st.session_state.get("resolve_note")
+    if note:
+        st.caption(f"Last settlement check: {note}")
+
     rows = db.execute(
         "SELECT model_up, adj_up, mid, side, cost, would_trade, result FROM signals "
         "WHERE result IS NOT NULL").fetchall()
-    total = db.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
-    proven, n = bot_proven()
-    st.caption(f"{total} markets logged, {len(rows)} settled. Needs {PROVEN_MIN_SAMPLES}+ settled "
-               f"before the bot can count as proven. Status: {'PROVEN' if proven else 'not proven yet'}")
     if not rows:
         return
     brier_model = sum((r[0] - (r[6] == "yes")) ** 2 for r in rows) / len(rows)
     brier_mkt = sum((r[2] - (r[6] == "yes")) ** 2 for r in rows) / len(rows)
-    c1, c2 = st.columns(2)
-    c1.metric("Model error (Brier, lower=better)", f"{brier_model:.3f}")
-    c2.metric("Kalshi price error (Brier)", f"{brier_mkt:.3f}",
+    d1, d2 = st.columns(2)
+    d1.metric("Model error (Brier, lower=better)", f"{brier_model:.3f}")
+    d2.metric("Kalshi price error (Brier)", f"{brier_mkt:.3f}",
               "model beats market" if brier_model < brier_mkt else "market beats model",
               delta_color="normal" if brier_model < brier_mkt else "inverse")
     hyp = [r for r in rows if r[5]]
@@ -690,6 +729,9 @@ def main_loop():
     st.divider()
 
     # ---------------- Entries ----------------
+    t_all, t_settled, t_pending = proof_counts()
+    st.caption(f"Proof progress: {t_settled}/{PROVEN_MIN_SAMPLES} markets settled "
+               f"({t_pending} waiting to settle, {t_all} logged)")
     cols = st.columns(len(picked) or 1)
     for i, asset in enumerate(picked):
         with cols[i]:
