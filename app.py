@@ -383,6 +383,21 @@ def analyse(asset):
     p_stat = cdf(z)
     
     votes, rsi_v = technicals(closed)
+
+    # --- Discord display label (cosmetic only — does not affect trading) ---
+    _bull = sum(1 for v in votes.values() if v == 1)
+    _bear = sum(1 for v in votes.values() if v == -1)
+    if _bull >= 4:
+        pat = {"name": "Strong Bull Alignment", "state": "bullish"}
+    elif _bear >= 4:
+        pat = {"name": "Strong Bear Alignment", "state": "bearish"}
+    elif _bull > _bear:
+        pat = {"name": "Mild Bull Bias", "state": "bullish"}
+    elif _bear > _bull:
+        pat = {"name": "Mild Bear Bias", "state": "bearish"}
+    else:
+        pat = {"name": "Mixed / Chop", "state": "neutral"}
+    # --- end cosmetic label ---
     w = 0.15 + 0.35 * min(secs / 900, 1)
     model = (1 - w) * p_stat + w * (0.5 + 0.25 * sum(votes.values()) / len(votes))
     
