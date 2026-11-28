@@ -5,7 +5,7 @@
 #  - UI (bottom half): sliders + dashboard. Sliders are saved to the database
 #    and the engine reads the saved values every cycle.
 # =====================================================================
-import math, time, os, json, base64, uuid, sqlite3, threading
+import math, time, os, json, base64, uuid, sqlite3, threading, zlib, hashlib
 from datetime import datetime, timezone, timedelta
 import requests
 from cryptography.hazmat.primitives import serialization, hashes
@@ -43,18 +43,18 @@ LOG_WINDOW = (60, 300)    # a market is logged when it has between these many se
 DEFAULTS = {
     "auto_trade": False,
     # entry
-    "min_edge": 4, "min_secs_left": 120, "safe_max_price": 72,
+    "min_edge": 2, "min_secs_left": 91, "safe_max_price": 85,
     "scalp_on": False, "scalp_tp": 6, "scalp_sl": 6,
     # sizing
     "bankroll": 20.0, "kelly": 0.15, "max_stake_pct": 5,
-    "bet_min": 1.0, "bet_max": 2.0, "fixed_bet": False, "max_contracts": 3,
+    "bet_min": 1.0, "bet_max": 3.0, "fixed_bet": False, "max_contracts": 3,
     "daily_loss_cap": 3.0,
     # safety / model
-    "pause_on_losses": True, "follow_kalshi": True, "never_against": 70,
+    "pause_on_losses": True, "follow_kalshi": True, "never_against": 74,
     "shrink": 70, "max_edge": 8, "tech_weight": 15, "proven_min": 40,
     # exits
     "take_profit": 20, "stop_loss": -20, "force_close": 40,
-    "flip_exit": 40, "profit_lock": 50, "min_hold": 30,
+    "flip_exit": 31, "profit_lock": 45, "min_hold": 20,
     # assets / display
     "assets": ["BTC", "ETH", "SOL"], "show_tv": False,
     # discord
@@ -164,6 +164,139 @@ def save_settings(S):
     new = json.dumps(S, sort_keys=True)
     if meta_get("settings") != new:
         meta_set("settings", new)
+
+
+# ---------------------------------------------------------------------
+# Persistence without a Fly volume (Upstash Redis over HTTPS) + engine lock
+# ---------------------------------------------------------------------
+MACHINE_ID = os.environ.get("FLY_MACHINE_ID", "local")
+ENGINE_ID = f"{MACHINE_ID}:{os.getpid()}:{uuid.uuid4().hex[:6]}"
+STATE_KEY = os.environ.get("STATE_KEY", "kalshi_bot_state_v1")
+LOCK_KEY = STATE_KEY + ":engine_lock"
+STATE_TABLES = ["trades", "signals", "blocked", "meta", "alerts", "held"]
+VOLATILE_META = {"last_tick", "engine_started", "balance", "resolve_note", "last_backup",
+                 "engine_owner", "engine_hb"}
+_remote_ready = False
+_last_push_hash, _last_push_at, _last_claim_ok = None, 0.0, 0.0
+
+
+def remote_on():
+    return bool(os.environ.get("UPSTASH_REDIS_REST_URL") and os.environ.get("UPSTASH_REDIS_REST_TOKEN"))
+
+
+def remote_cmd(cmd):
+    r = requests.post(os.environ["UPSTASH_REDIS_REST_URL"].rstrip("/"), json=cmd,
+                      headers={"Authorization": "Bearer " + os.environ["UPSTASH_REDIS_REST_TOKEN"]},
+                      timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, dict) and data.get("error"):
+        raise RuntimeError(data["error"])
+    return data.get("result") if isinstance(data, dict) else data
+
+
+def dump_state():
+    out = {}
+    for t in STATE_TABLES:
+        cols = [r[1] for r in dbq(f"PRAGMA table_info({t})")]
+        rows = dbq(f"SELECT {','.join(cols)} FROM {t}")
+        if t == "meta":
+            rows = [r for r in rows if r[0] not in VOLATILE_META]
+        out[t] = {"cols": cols, "rows": rows}
+    return json.dumps(out, separators=(",", ":"), sort_keys=True)
+
+
+def load_state(blob):
+    data = json.loads(zlib.decompress(base64.b64decode(blob)).decode())
+    for t in STATE_TABLES:
+        if t not in data:
+            continue
+        cols = data[t]["cols"]
+        dbq(f"DELETE FROM {t}")
+        for row in data[t]["rows"]:
+            dbq(f"INSERT OR REPLACE INTO {t} ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                tuple(row))
+    dbq("SELECT 1", commit=True)
+
+
+def remote_pull():
+    """Load the latest saved state from Upstash. Marks the remote as safe to write to."""
+    global _remote_ready
+    blob = remote_cmd(["GET", STATE_KEY])
+    if blob:
+        load_state(blob)
+    _remote_ready = True
+
+
+def remote_sync_start():
+    """Used by the page at startup: restore saved settings into an empty database."""
+    global _remote_ready
+    if not remote_on() or _remote_ready:
+        return
+    try:
+        fresh = not (dbq("SELECT 1 FROM meta WHERE k='settings'") or dbq("SELECT 1 FROM trades LIMIT 1")
+                     or dbq("SELECT 1 FROM signals LIMIT 1"))
+        if fresh:
+            remote_pull()
+        else:
+            remote_cmd(["PING"])
+            _remote_ready = True
+    except Exception as e:
+        elog("restore", e)
+
+
+def maybe_push_backup(force=False):
+    """Save everything to Upstash whenever it changes (at most every 30s).
+    Never pushes before the remote state is known, so a failed restore cannot wipe the backup."""
+    global _last_push_hash, _last_push_at
+    if not remote_on() or not _remote_ready:
+        return
+    now = time.time()
+    if not force and now - _last_push_at < 30:
+        return
+    _last_push_at = now
+    state = dump_state()
+    h = hashlib.md5(state.encode()).hexdigest()
+    if h == _last_push_hash:
+        return
+    blob = base64.b64encode(zlib.compress(state.encode(), 9)).decode()
+    if len(blob) > 900_000:
+        elog("backup", "saved state is too large to back up")
+        return
+    remote_cmd(["SET", STATE_KEY, blob])
+    _last_push_hash = h
+    meta_set("last_backup", now)
+
+
+def claim_engine():
+    """Only one engine may run. With Upstash this holds across machines; without it, per machine."""
+    global _last_claim_ok
+    now = time.time()
+    if remote_on():
+        try:
+            got = remote_cmd(["SET", LOCK_KEY, ENGINE_ID, "NX", "EX", 30])
+            if got == "OK":
+                try:
+                    remote_pull()                   # take over with the latest saved state
+                except Exception as e:
+                    elog("takeover", e)
+                    remote_cmd(["DEL", LOCK_KEY])
+                    return False
+            else:
+                if remote_cmd(["GET", LOCK_KEY]) != ENGINE_ID:
+                    return False
+                remote_cmd(["SET", LOCK_KEY, ENGINE_ID, "EX", 30])
+            _last_claim_ok = now
+            return True
+        except Exception as e:
+            elog("lock", e)
+            return (now - _last_claim_ok) < 60      # brief outage: keep running if we were the owner
+    owner, hb = meta_get("engine_owner"), float(meta_get("engine_hb", 0) or 0)
+    if owner and owner != ENGINE_ID and now - hb < 30:
+        return False
+    meta_set("engine_owner", ENGINE_ID)
+    meta_set("engine_hb", now)
+    return True
 
 
 # ---------------------------------------------------------------------
@@ -925,15 +1058,40 @@ def engine_tick():
 
 
 def worker_loop():
+    if not claim_engine():
+        return                                      # another engine owns it: stay on standby
+    time.sleep(2)
+    if not claim_engine():
+        return                                      # lost a start-up race
     meta_set("engine_started", time.time())
     while True:
         t0 = time.time()
+        if not claim_engine():
+            return
         try:
             engine_tick()
         except Exception as e:
             elog("tick", e)
+        try:
+            maybe_push_backup()
+        except Exception as e:
+            elog("backup", e)
         time.sleep(max(1.0, TICK_SECONDS - (time.time() - t0)))
 
+
+def engine_forever():
+    """Run the engine; if another copy owns it, wait and take over if that one dies."""
+    while True:
+        try:
+            worker_loop()
+        except Exception as e:
+            elog("engine", e)
+        time.sleep(15)
+
+
+# Started from start.sh as a separate process so the engine runs even if nobody opens the page.
+if __name__ == "__main__" and os.environ.get("RUN_ENGINE_ONLY") == "1":
+    engine_forever()
 
 # ===== UI =====
 import streamlit as st
@@ -953,12 +1111,13 @@ except Exception as e:
 
 @st.cache_resource
 def start_worker():
-    t = threading.Thread(target=worker_loop, daemon=True, name="kalshi-engine")
+    t = threading.Thread(target=engine_forever, daemon=True, name="kalshi-engine")
     t.start()
     return t
 
 
 start_worker()
+remote_sync_start()
 
 SV = get_settings()
 
@@ -1064,6 +1223,25 @@ def dashboard():
 
     bal = float(meta_get("balance", 0) or 0)
     st.metric("Available Balance", f"${bal:.2f}")
+
+    if remote_on():
+        lb = float(meta_get("last_backup", 0) or 0)
+        st.caption("☁️ Settings and logs are backed up to Upstash"
+                   + (f" · last backup {now - lb:.0f}s ago" if lb else " · first backup pending"))
+        try:
+            owner = cached("lockowner", 20, lambda: remote_cmd(["GET", LOCK_KEY]))
+            if owner and not str(owner).startswith(MACHINE_ID + ":"):
+                st.warning("The engine is running on a DIFFERENT Fly machine than this page. You have more "
+                           "than one machine: delete the extras in the Fly dashboard (Machines) so settings "
+                           "you change here reach the engine.")
+        except Exception:
+            pass
+    elif os.path.ismount(os.path.dirname(DB_PATH)):
+        st.caption("💾 Settings and logs are saved on the Fly volume")
+    else:
+        st.warning("Nothing is saved between restarts yet: settings and logs reset when the machine "
+                   "restarts. Add the UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN secrets "
+                   "(free Upstash database) to fix this.")
 
     if S["pause_on_losses"] and losing_streak():
         st.warning("Paused: the last 3 closed trades were losses.")
@@ -1184,9 +1362,6 @@ def accuracy_panel():
     st.caption(f"Last market logged: {last[0][0]} at {last[0][1][:19]} UTC" if last
                else "Nothing logged yet. The first market is logged within about 15 minutes.")
 
-    if not os.path.ismount(os.path.dirname(DB_PATH)):
-        st.warning(f"{os.path.dirname(DB_PATH)} is not a mounted Fly volume, so this log is wiped on every "
-                   "deploy or restart. Check the [mounts] section of fly.toml.")
     cutoff = (datetime.now(timezone.utc) - timedelta(minutes=25)).isoformat()
     stale = dbq("SELECT COUNT(*) FROM signals WHERE result IS NULL AND logged_at < ?", (cutoff,))[0][0]
     if stale:
