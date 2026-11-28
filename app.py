@@ -485,7 +485,7 @@ def log_trade(ticker, asset, side, entry, exit_p, count, pnl, status):
 
 
 def log_signal(d):
-    """One row per market, logged once when 90-240s remain, whether or not we trade."""
+    """One row per market, logged once when 60-300s remain, whether or not we trade."""
     db.execute(
         "INSERT OR IGNORE INTO signals (ticker, asset, model_up, adj_up, mid, side, cost, edge, would_trade, secs, logged_at) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
@@ -535,7 +535,7 @@ def calibration_panel():
     c1.metric("Logged", total)
     c2.metric(f"Settled (counts toward {PROVEN_MIN_SAMPLES})", settled)
     c3.metric("Waiting to settle", pending)
-    st.caption("A market is logged when it has 90-240 seconds left, and only while this page is open. "
+    st.caption("A market is logged when it has 60-300 seconds left, and only while this page is open. "
                "It counts toward the total after Kalshi settles it. "
                f"Status: {'PROVEN' if proven else 'not proven yet'}")
 
@@ -752,11 +752,22 @@ def main_loop():
             st.write(f"Model {d['up'] * 100:.0f}% → adj {d['adj'] * 100:.0f}% vs Kalshi {d['mid'] * 100:.0f}%")
             st.write(f"Edge **{d['edge'] * 100:.1f}%** → **{d['side'].upper()}** @ {d['cost'] * 100:.0f}%")
 
-            if 90 < d["secs"] < 240:
+            # Signal logging: first sighting of each market with 60-300s left
+            if 60 < d["secs"] < 300:
                 try:
                     log_signal(d)
-                except Exception:
-                    pass
+                except Exception as e:
+                    st.caption(f"Could not save signal: {e}")
+            try:
+                saved = db.execute("SELECT 1 FROM signals WHERE ticker=?", (d["ticker"],)).fetchone()
+            except Exception:
+                saved = None
+            if saved:
+                st.caption("Logged for accuracy test ✓")
+            elif d["secs"] >= 300:
+                st.caption(f"Will be logged in {d['secs'] - 300:.0f}s")
+            else:
+                st.caption("Not logged (window passed before the page saw this market)")
 
             if d["should_trade"]:
                 n, stake = size_for(d, bal_now)
