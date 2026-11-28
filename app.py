@@ -175,9 +175,9 @@ STATE_KEY = os.environ.get("STATE_KEY", "kalshi_bot_state_v1")
 LOCK_KEY = STATE_KEY + ":engine_lock"
 STATE_TABLES = ["trades", "signals", "blocked", "meta", "alerts", "held"]
 VOLATILE_META = {"last_tick", "engine_started", "balance", "resolve_note", "last_backup",
-                 "engine_owner", "engine_hb"}
+                 "engine_owner", "engine_hb", "remote_error"}
 _remote_ready = False
-_last_push_hash, _last_push_at, _last_claim_ok = None, 0.0, 0.0
+_last_push_hash, _last_push_at = None, 0.0
 
 
 def remote_on():
@@ -188,7 +188,8 @@ def remote_cmd(cmd):
     r = requests.post(os.environ["UPSTASH_REDIS_REST_URL"].rstrip("/"), json=cmd,
                       headers={"Authorization": "Bearer " + os.environ["UPSTASH_REDIS_REST_TOKEN"]},
                       timeout=10)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        raise RuntimeError(f"Upstash {r.status_code}: {r.text[:150]}")
     data = r.json()
     if isinstance(data, dict) and data.get("error"):
         raise RuntimeError(data["error"])
@@ -239,7 +240,6 @@ def remote_sync_start():
         if fresh:
             remote_pull()
         else:
-            remote_cmd(["PING"])
             _remote_ready = True
     except Exception as e:
         elog("restore", e)
@@ -252,7 +252,7 @@ def maybe_push_backup(force=False):
     if not remote_on() or not _remote_ready:
         return
     now = time.time()
-    if not force and now - _last_push_at < 30:
+    if not force and now - _last_push_at < 60:
         return
     _last_push_at = now
     state = dump_state()
@@ -268,35 +268,44 @@ def maybe_push_backup(force=False):
     meta_set("last_backup", now)
 
 
+_pulled_once, _remote_checked_at, _remote_ok = False, 0.0, True
+
+
 def claim_engine():
-    """Only one engine may run. With Upstash this holds across machines; without it, per machine."""
-    global _last_claim_ok
+    """Only one engine may run.
+    - On one machine: a lock in the local database decides between the engine process and the page's thread.
+    - Across machines (when Upstash is set): a lock keyed by machine id, refreshed once a minute, so Upstash
+      usage stays far below the free plan's 500K commands a month."""
+    global _pulled_once, _remote_checked_at, _remote_ok
     now = time.time()
-    if remote_on():
-        try:
-            got = remote_cmd(["SET", LOCK_KEY, ENGINE_ID, "NX", "EX", 30])
-            if got == "OK":
-                try:
-                    remote_pull()                   # take over with the latest saved state
-                except Exception as e:
-                    elog("takeover", e)
-                    remote_cmd(["DEL", LOCK_KEY])
-                    return False
-            else:
-                if remote_cmd(["GET", LOCK_KEY]) != ENGINE_ID:
-                    return False
-                remote_cmd(["SET", LOCK_KEY, ENGINE_ID, "EX", 30])
-            _last_claim_ok = now
-            return True
-        except Exception as e:
-            elog("lock", e)
-            return (now - _last_claim_ok) < 60      # brief outage: keep running if we were the owner
     owner, hb = meta_get("engine_owner"), float(meta_get("engine_hb", 0) or 0)
     if owner and owner != ENGINE_ID and now - hb < 30:
         return False
     meta_set("engine_owner", ENGINE_ID)
     meta_set("engine_hb", now)
-    return True
+    if not remote_on():
+        return True
+    if now - _remote_checked_at >= 60:
+        _remote_checked_at = now
+        try:
+            cur = remote_cmd(["GET", LOCK_KEY])
+            if cur is None:
+                _remote_ok = remote_cmd(["SET", LOCK_KEY, MACHINE_ID, "NX", "EX", 150]) == "OK"
+            elif cur == MACHINE_ID:
+                remote_cmd(["SET", LOCK_KEY, MACHINE_ID, "EX", 150])
+                _remote_ok = True
+            else:
+                _remote_ok = False                  # another Fly machine owns the engine
+            if _remote_ok and not _pulled_once:
+                remote_pull()                       # start from the latest saved state
+                _pulled_once = True
+            if meta_get("remote_error"):
+                meta_set("remote_error", "")
+        except Exception as e:
+            elog("lock", e)
+            meta_set("remote_error", str(e)[:200])
+            _remote_ok = True                       # Upstash broken: keep running, just no backups
+    return _remote_ok
 
 
 # ---------------------------------------------------------------------
@@ -401,7 +410,10 @@ def dollars(m, key):
 
 
 def parse_ts(s):
-    return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
 
 
 def asset_from_ticker(ticker):
@@ -520,8 +532,12 @@ def place_order(ticker, side, count, price, tif, reduce_only=False):
 def enter_order(ticker, side, n, ya, yb):
     """Buy with an immediate-or-cancel order so nothing is left resting."""
     if side == "yes":
-        return place_order(ticker, "bid", n, min(0.99, round((ya or 0.5) + 0.01, 4)), "immediate_or_cancel")
-    return place_order(ticker, "ask", n, max(0.01, round((yb or 0.5) - 0.01, 4)), "immediate_or_cancel")
+        if ya is None or ya >= 0.99:
+            raise ValueError("no usable ask to buy into")
+        return place_order(ticker, "bid", n, min(0.99, round(ya + 0.01, 4)), "immediate_or_cancel")
+    if yb is None or yb <= 0.01:
+        raise ValueError("no usable bid to sell into")
+    return place_order(ticker, "ask", n, max(0.01, round(yb - 0.01, 4)), "immediate_or_cancel")
 
 
 def close_order(ticker, side, n, yb, ya, slip):
@@ -642,13 +658,16 @@ def analyse(asset, S):
     up = max(0.035, min(0.965, (1 - tw) * p_stat + tw * p_tech))
 
     ya, yb = dollars(m, "yes_ask"), dollars(m, "yes_bid")
-    mid = (ya + yb) / 2 if ya and yb else (ya or yb or 0.5)
+    if ya is not None and yb is not None:
+        mid = (ya + yb) / 2
+    else:
+        mid = ya if ya is not None else (yb if yb is not None else 0.5)
 
     shrink = S["shrink"] / 100.0
     adj = (1 - shrink) * up + shrink * mid
 
-    cost_yes = ya if ya else mid
-    cost_no = (1 - yb) if yb else (1 - mid)
+    cost_yes = ya if ya is not None else mid
+    cost_no = (1 - yb) if yb is not None else (1 - mid)
     n_est = max(1, int(S["max_contracts"]))
     edge_yes = adj - cost_yes - fee_pc(cost_yes, n_est)
     edge_no = (1 - adj) - cost_no - fee_pc(cost_no, n_est)
@@ -896,6 +915,9 @@ def handle_positions(S, positions, A):
                 attempts += 1
             except Exception as e:
                 elog(f"close {t}", e)
+                if should_alert(f"{t}|CLOSEFAIL", 120):
+                    send_discord(S, f"⚠️ Auto-sell FAILED on `{t}`: {str(e)[:150]}. "
+                                    "Sell it yourself on Kalshi.")
 
         upsert_held({"ticker": t, "asset": asset, "side": side, "count": n, "entry": entry or 0.0,
                      "mode": mode, "last_pnl": pnl, "last_cur": current, "opened_at": opened,
@@ -921,21 +943,22 @@ def handle_positions(S, positions, A):
                     send_discord(S, f"⚠️ The buy on `{t}` did not fill (price moved). No position was opened.")
             continue
         entry = row["entry"] or 0.0
-        result, closed_ts = None, 0
         try:
             mk = get_market(t, fresh=True)
-            result = mk.get("result")
-            closed_ts = parse_ts(mk["close_time"]) if mk.get("close_time") else 0
         except Exception as e:
             elog(f"finalize {t}", e)
-        if row["exit_reason"]:
-            status, exit_p, pnl = row["exit_reason"], row["last_cur"], row["last_pnl"]
-        elif result in ("yes", "no"):
+            continue                                 # can't tell what happened yet: try again next cycle
+        result = mk.get("result")
+        closed_ts = parse_ts(mk["close_time"]) if mk.get("close_time") else 0
+        closed = bool(closed_ts) and closed_ts <= now
+        if closed and result in ("yes", "no"):       # it ran to expiry: use the real settlement
             exit_p = 1.0 if row["side"] == result else 0.0
             pnl = ((exit_p - entry) / entry) if entry else 0.0
             status = "SETTLED"
-        elif closed_ts and closed_ts <= now and now - closed_ts < 600:
+        elif closed and now - closed_ts < 600:
             continue                                 # waiting for Kalshi to publish the result
+        elif row["exit_reason"]:                     # sold before the market closed
+            status, exit_p, pnl = row["exit_reason"], row["last_cur"], row["last_pnl"]
         else:
             status, exit_p, pnl = "MANUAL", row["last_cur"], row["last_pnl"]
         log_trade(t, row["asset"], row["side"], entry, exit_p, row["count"], pnl or 0.0, status)
@@ -982,7 +1005,7 @@ def resolve_signals():
 def try_enter(S, d, bal):
     n, stake = size_for(S, d, bal)
     if n <= 0 or (bal or 0) < 2:
-        return False
+        return 0.0
     t = d["ticker"]
     block_ticker(t, "entered")                       # one attempt per market, win or lose
     try:
@@ -991,11 +1014,11 @@ def try_enter(S, d, bal):
         elog(f"entry {t}", e)
         if S["alert_buy"]:
             send_discord(S, f"⚠️ Buy failed on `{t}`: {str(e)[:150]}")
-        return False
+        return 0.0
     upsert_held({"ticker": t, "asset": d["asset"], "side": d["side"], "count": n, "entry": d["cost"],
                  "mode": d["mode"], "last_pnl": 0.0, "last_cur": d["cost"], "opened_at": time.time(),
                  "seen": 0, "exit_reason": None, "attempts": 0})
-    return True
+    return n * d["cost"]                             # cash committed, so later assets see less balance
 
 
 def engine_tick():
@@ -1046,7 +1069,7 @@ def engine_tick():
                 if S["alert_scalp" if kind == "SCALP" else "alert_buy"] and should_alert(f"{t}|{kind}", 10 ** 9):
                     send_discord(S, msg_scalp(S, d, n) if kind == "SCALP" else msg_buy(S, d, n))
                 if S["auto_trade"]:
-                    try_enter(S, d, bal)
+                    bal -= try_enter(S, d, bal)
             elif LOG_WINDOW[0] < d["secs"] < LOG_WINDOW[1] and S["alert_wait"] \
                     and should_alert(f"{t}|WAIT", 10 ** 9):
                 send_discord(S, msg_wait(S, d))
@@ -1072,6 +1095,7 @@ def worker_loop():
             engine_tick()
         except Exception as e:
             elog("tick", e)
+        meta_set("last_tick", time.time())
         try:
             maybe_push_backup()
         except Exception as e:
@@ -1208,7 +1232,13 @@ def dashboard():
     last_tick = float(meta_get("last_tick", 0) or 0)
     age = now - last_tick if last_tick else None
     if age is None:
-        st.info("Engine is starting up. The first cycle takes a few seconds.")
+        st.warning("The engine has not finished a cycle yet. If this stays for more than a minute, "
+                   "the reason is listed here.")
+        for _at, _src, _msg in dbq("SELECT at, src, msg FROM elog ORDER BY id DESC LIMIT 3"):
+            st.caption(f"{_src}: {_msg}")
+        _rerr = meta_get("remote_error")
+        if _rerr:
+            st.caption(f"Upstash problem: {_rerr}")
     elif age > 60:
         st.error(f"Engine has not run for {age:.0f}s. Check `fly logs`.")
     else:
@@ -1224,13 +1254,17 @@ def dashboard():
     bal = float(meta_get("balance", 0) or 0)
     st.metric("Available Balance", f"${bal:.2f}")
 
+    if remote_on() and meta_get("remote_error"):
+        st.warning(f"Upstash is not working, so nothing is being backed up: {meta_get('remote_error')}. "
+                   "Check the two secrets (name and value) and that you used the normal token, not the "
+                   "read-only one.")
     if remote_on():
         lb = float(meta_get("last_backup", 0) or 0)
         st.caption("☁️ Settings and logs are backed up to Upstash"
                    + (f" · last backup {now - lb:.0f}s ago" if lb else " · first backup pending"))
         try:
-            owner = cached("lockowner", 20, lambda: remote_cmd(["GET", LOCK_KEY]))
-            if owner and not str(owner).startswith(MACHINE_ID + ":"):
+            owner = cached("lockowner", 300, lambda: remote_cmd(["GET", LOCK_KEY]))
+            if owner and str(owner) != MACHINE_ID:
                 st.warning("The engine is running on a DIFFERENT Fly machine than this page. You have more "
                            "than one machine: delete the extras in the Fly dashboard (Machines) so settings "
                            "you change here reach the engine.")
